@@ -1,0 +1,79 @@
+{
+  "schema": 2,
+  "source_sets": {
+    "patch_sources": [
+      "sglang",
+      "ktransformers"
+    ],
+    "dependencies": [
+      {
+        "component": "llama",
+        "destination": "ktransformers/third_party/llama.cpp"
+      },
+      {
+        "component": "pybind11",
+        "destination": "ktransformers/third_party/pybind11"
+      }
+    ],
+    "recorded_only": [
+      "flashinfer",
+      "flashinfer-alternate"
+    ]
+  },
+  "archives": [
+    {
+      "component": "sglang",
+      "archive": "sglang-1aa0e962b206102b7c439a4a0c4981cfec6e87bc.tar.gz",
+      "sha256": "61f7b87cadd1dea7aef28449d075d56a8e50f749ff35c5fdc1afaf38673047f3",
+      "upstream": "https://github.com/sgl-project/sglang",
+      "revision": "1aa0e962b206102b7c439a4a0c4981cfec6e87bc",
+      "codeload_url": "https://codeload.github.com/sgl-project/sglang/tar.gz/1aa0e962b206102b7c439a4a0c4981cfec6e87bc"
+    },
+    {
+      "component": "ktransformers",
+      "archive": "ktransformers-e80614fc2d2c3990bd1abe895d5014fc14733fde.tar.gz",
+      "sha256": "6732096fbfd563d8f39912b2a0e88e4278b7f7e735e3a1536d93d226b933b35b",
+      "upstream": "https://github.com/kvcache-ai/ktransformers",
+      "revision": "e80614fc2d2c3990bd1abe895d5014fc14733fde",
+      "codeload_url": "https://codeload.github.com/kvcache-ai/ktransformers/tar.gz/e80614fc2d2c3990bd1abe895d5014fc14733fde"
+    },
+    {
+      "component": "llama",
+      "archive": "llama-a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f.tar.gz",
+      "sha256": "8a1a858dcc07f70dbf1a23993a93890d67a1509abe54552c1f6057ba443001c6",
+      "upstream": "https://github.com/ggml-org/llama.cpp",
+      "revision": "a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f",
+      "codeload_url": "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f"
+    },
+    {
+      "component": "pybind11",
+      "archive": "pybind11-bb05e0810b87e74709d9f4c4545f1f57a1b386f5.tar.gz",
+      "sha256": "c6ee63c9c6c2aa2d14c3db9a519f67777c6c47286794edb2840273589dda701d",
+      "upstream": "https://github.com/pybind/pybind11",
+      "revision": "bb05e0810b87e74709d9f4c4545f1f57a1b386f5",
+      "codeload_url": "https://codeload.github.com/pybind/pybind11/tar.gz/bb05e0810b87e74709d9f4c4545f1f57a1b386f5"
+    },
+    {
+      "component": "flashinfer",
+      "archive": "flashinfer-915e7c49aececa5ba4fdf60ac0f4038ca1455fc1.tar.gz",
+      "sha256": "e38294e0b576b0666edbb53809e0e9e7eba48cbb4a565dbd7e29abe981879fc2",
+      "upstream": "https://github.com/flashinfer-ai/flashinfer",
+      "revision": "915e7c49aececa5ba4fdf60ac0f4038ca1455fc1",
+      "codeload_url": "https://codeload.github.com/flashinfer-ai/flashinfer/tar.gz/915e7c49aececa5ba4fdf60ac0f4038ca1455fc1"
+    },
+    {
+      "component": "flashinfer-alternate",
+      "archive": "flashinfer-v0618-69ff11fc.tar.gz",
+      "sha256": "4fc85abaa6210d6a1773e6011ff572aa0c04b7030644b74f75a2db2dbda472a9",
+      "upstream": "https://github.com/flashinfer-ai/flashinfer",
+      "revision": "69ff11fc4954396d98326656dc85debd2223f637",
+      "codeload_url": "https://codeload.github.com/flashinfer-ai/flashinfer/tar.gz/69ff11fc4954396d98326656dc85debd2223f637"
+    }
+  ],
+  "recipe": {
+    "upstream": "https://github.com/05yuki/dsv41-flash-dual-epyc",
+    "revision": "3bf450e11ffe837b4bb6c9550a7ca682dac0fbaf",
+    "codeload_url": "https://codeload.github.com/05yuki/dsv41-flash-dual-epyc/tar.gz/3bf450e11ffe837b4bb6c9550a7ca682dac0fbaf"
+  },
+  "flashinfer_scope": "recorded archives; no FlashInfer patch distributed; validate actual external runtime separately"
+}

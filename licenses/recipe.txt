@@ -1,0 +1,23 @@
+Apache License, Version 2.0
+
+Copyright 2026 05yuki
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+tools/engram-adapter/row_store.cpp is derived from adapter/row_store.cpp in
+https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
+(Copyright (c) 2026 0xSero, MIT License); the MIT terms apply to that file.
+The patches under patches/ modify sgl-project/sglang (branch dsv4.1) and
+kvcache-ai/ktransformers (kt-kernel), both Apache-2.0.

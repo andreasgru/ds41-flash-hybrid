@@ -1,0 +1,42 @@
+{
+  "1": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 1,
+    "SWAP_AB": true,
+    "SPLIT_K": 8,
+    "num_warps": 4,
+    "num_stages": 2
+  },
+  "2": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 1,
+    "SWAP_AB": true,
+    "SPLIT_K": 8,
+    "num_warps": 4,
+    "num_stages": 2
+  },
+  "4": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 1,
+    "SWAP_AB": true,
+    "SPLIT_K": 8,
+    "num_warps": 4,
+    "num_stages": 2
+  },
+  "8": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 8,
+    "SWAP_AB": true,
+    "SPLIT_K": 8,
+    "num_warps": 4,
+    "num_stages": 2
+  }
+}

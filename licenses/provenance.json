@@ -1,0 +1,48 @@
+[
+  {
+    "file": "licenses/sglang.txt",
+    "archive_sha256": "61f7b87cadd1dea7aef28449d075d56a8e50f749ff35c5fdc1afaf38673047f3",
+    "member": "sglang-1aa0e962b206102b7c439a4a0c4981cfec6e87bc/LICENSE",
+    "sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747"
+  },
+  {
+    "file": "licenses/ktransformers.txt",
+    "archive_sha256": "6732096fbfd563d8f39912b2a0e88e4278b7f7e735e3a1536d93d226b933b35b",
+    "member": "ktransformers-e80614fc2d2c3990bd1abe895d5014fc14733fde/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  {
+    "file": "licenses/llama.txt",
+    "archive_sha256": "8a1a858dcc07f70dbf1a23993a93890d67a1509abe54552c1f6057ba443001c6",
+    "member": "llama.cpp-a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f/LICENSE",
+    "sha256": "e562a2ddfaf8280537795ac5ecd34e3012b6582a147ef69ba6a6a5c08c84757d"
+  },
+  {
+    "file": "licenses/pybind11.txt",
+    "archive_sha256": "c6ee63c9c6c2aa2d14c3db9a519f67777c6c47286794edb2840273589dda701d",
+    "member": "pybind11-bb05e0810b87e74709d9f4c4545f1f57a1b386f5/LICENSE",
+    "sha256": "83965b843b98f670d3a85bd041ed4b372c8ec50d7b4a5995a83ac697ba675dcb"
+  },
+  {
+    "file": "licenses/flashinfer.txt",
+    "archive_sha256": "e38294e0b576b0666edbb53809e0e9e7eba48cbb4a565dbd7e29abe981879fc2",
+    "member": "flashinfer-915e7c49aececa5ba4fdf60ac0f4038ca1455fc1/LICENSE",
+    "sha256": "cb67c224f503e0a063908950b12f89a7280c6e527dcffac972aa114e4bf3c5de"
+  },
+  {
+    "file": "licenses/flashinfer-alternate.txt",
+    "archive_sha256": "4fc85abaa6210d6a1773e6011ff572aa0c04b7030644b74f75a2db2dbda472a9",
+    "member": "flashinfer-69ff11fc4954396d98326656dc85debd2223f637/LICENSE",
+    "sha256": "f3514f24f2b94d09c409abbf4020cf600e4059098c697110eb91a4a2b235fbb7"
+  },
+  {
+    "file": "licenses/recipe.txt",
+    "source": "05yuki recipe pin 3bf450e11ffe837b4bb6c9550a7ca682dac0fbaf",
+    "sha256": "c02ec08bc98161c6cae9d82a9ba361153c7964d34e18b498e04a83e64e657757"
+  },
+  {
+    "file": "licenses/MIT-0xSero.txt",
+    "source": "standard MIT terms; copyright line from preserved adapter headers",
+    "sha256": "cafea160e12f3e5e2c8692d58c5c5f8535b3348830ab6f337f138b8ee67d6b1c"
+  }
+]

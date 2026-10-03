@@ -1,0 +1,1800 @@
+Origin: own cleaned multi-user layer
+Purpose: English source and qualified extension names
+License: Apache-2.0; preserve upstream notices
+
+diff -ruN a/kt-kernel/cpu_backend/defer_split.h b/kt-kernel/cpu_backend/defer_split.h
+--- a/kt-kernel/cpu_backend/defer_split.h	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/cpu_backend/defer_split.h	2026-10-03 13:31:08.228234941 +0200
+@@ -0,0 +1,70 @@
++/**
++ * Deferral split (KT_DS41_MU_DEFER_MHC): divide the routed top-k of one MoE call into the part that the
++ * CPU computes immediately and the part that is deferred behind the attention of the next layer.
++ *
++ * mode 0 ("all", same rule as BaseMoEWrapper.select_deferred_experts, experts_base.py:388-416):
++ *   per token the (k - d) largest weights are protected; an expert id is protected for the whole call as soon as it
++ *   is protected for ANY token (union over tokens, like protected_flag); every (t, j) whose id is protected stays
++ *   immediate, the rest is deferred. GPU experts may land in `def`; the CPU skips them anyway (should_skip_expert).
++ * mode 1 ("cpu"): like mode 0, but ranking and protection only among the CPU experts of each token (gpu_mask[id] == 0);
++ *   GPU experts always stay immediate (the GPU computes them regardless). Needs gpu_mask.
++ * Ties in the weights: the smaller position j wins protection (deterministic; torch.topk leaves the order open).
++ * Invalid ids (< 0 or >= expert_num) are -1 in both outputs.
++ * Returns the number of deferred (t, j) entries that are CPU experts (gpu_mask == nullptr: all valid deferred ids);
++ * 0 means the deferred call would compute nothing, the caller may zero the output instead.
++ * No CUDA, no allocation except the scratch vector (reused by the caller).
++ */
++#ifndef CPUINFER_DEFER_SPLIT_H
++#define CPUINFER_DEFER_SPLIT_H
++
++#include <cstdint>
++#include <vector>
++
++inline int defer_split(const int64_t* ids, const float* weights, int qlen, int k, int d, int mode, const uint8_t* gpu_mask,
++                       int expert_num, int64_t* imm, int64_t* def, std::vector<uint8_t>& flag) {
++  if (d < 0) d = 0;
++  if (d > k) d = k;
++  flag.assign((size_t)expert_num, 0);
++  auto valid = [&](int64_t e) { return e >= 0 && e < expert_num; };
++  auto is_gpu = [&](int64_t e) { return gpu_mask != nullptr && gpu_mask[e] != 0; };
++  // 1) protection flags (union over tokens)
++  for (int t = 0; t < qlen; ++t) {
++    const int64_t* id = ids + (size_t)t * k;
++    const float* w = weights + (size_t)t * k;
++    int n_cand = 0;
++    for (int j = 0; j < k; ++j)
++      if (valid(id[j]) && (mode == 0 || !is_gpu(id[j]))) ++n_cand;
++    const int keep = n_cand - d;  // protected candidates of this token
++    if (keep <= 0) continue;
++    for (int j = 0; j < k; ++j) {
++      if (!valid(id[j]) || (mode != 0 && is_gpu(id[j]))) continue;
++      // rank of candidate j: number of candidates that beat it (larger weight, or equal weight and smaller position)
++      int rank = 0;
++      for (int m = 0; m < k; ++m) {
++        if (m == j || !valid(id[m]) || (mode != 0 && is_gpu(id[m]))) continue;
++        if (w[m] > w[j] || (w[m] == w[j] && m < j)) ++rank;
++      }
++      if (rank < keep) flag[(size_t)id[j]] = 1;
++    }
++  }
++  // 2) split
++  int n_def_cpu = 0;
++  for (int t = 0; t < qlen; ++t) {
++    for (int j = 0; j < k; ++j) {
++      const size_t p = (size_t)t * k + j;
++      const int64_t e = ids[p];
++      if (!valid(e)) {
++        imm[p] = -1;
++        def[p] = -1;
++        continue;
++      }
++      const bool prot = flag[(size_t)e] != 0 || (mode != 0 && is_gpu(e));
++      imm[p] = prot ? e : -1;
++      def[p] = prot ? -1 : e;
++      if (!prot && !is_gpu(e)) ++n_def_cpu;
++    }
++  }
++  return n_def_cpu;
++}
++
++#endif  // CPUINFER_DEFER_SPLIT_H
+diff -ruN a/kt-kernel/cpu_backend/doorbell_core.h b/kt-kernel/cpu_backend/doorbell_core.h
+--- a/kt-kernel/cpu_backend/doorbell_core.h	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/cpu_backend/doorbell_core.h	2026-10-03 13:31:08.228406285 +0200
+@@ -0,0 +1,282 @@
++/**
++ * CB-JOIN poller core: CUDA-free part of DoorbellJoin; protocol state uses
++ * plain host flags and the MoE interface.
++ *
++ * Shared doorbell protocol:
++ *   index j = layer + 64 * half (half 1 = second micro-batch), flags go[j] / done[j] / ddone[j] / arrived[j],
++ *   go value = (d << 20) | (buf_id + 1), d = number of deferred experts (0 preserves existing CB-JOIN behavior bit-for-bit).
++ * Poller: immediate jobs first, in the fixed order of positions p = 2*(j mod 64) + (j div 64) starting after the last
++ *   finished job (A_L before B_L before A_{L+1}); after an immediate job with d > 0 its deferred part is queued (FIFO)
++ *   and runs only while no go is set. Deadlock-free: the poller never waits for the stream, and every flag the stream
++ *   waits for belongs to a job posted earlier on the same stream.
++ * Deferred part: defer_split() on the ids/weights of the buffer (same rule as select_deferred_experts), then
++ *   forward(imm ids -> output), done = 1, and later forward(def ids -> def_output) or zero-fill, ddone = 1.
++ */
++#ifndef CPUINFER_DOORBELL_CORE_H
++#define CPUINFER_DOORBELL_CORE_H
++
++#include <immintrin.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <exception>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++#include "defer_split.h"
++
++struct alignas(64) DoorbellFlag {
++  volatile uint32_t v;
++  uint32_t pad[15];
++};
++
++template <class Moe>
++class DoorbellCore {
++ public:
++  static constexpr int kHalfStride = 64;
++  static constexpr uint32_t kBufMask = (1u << 20) - 1;
++
++  struct Buf {
++    const int* qlen;
++    int k;
++    const int64_t* ids;
++    const float* weights;
++    const void* input;
++    void* output;
++    void* def_output;  // nullptr: this buffer cannot take deferred jobs
++    int def_row_bytes;  // bytes per token of def_output (hidden * sizeof(bf16)); zero-fill size
++  };
++  struct DeferStats {
++    uint64_t runs = 0, zero = 0, cpu_experts = 0, busy_ns = 0, late = 0;
++  };
++
++  DoorbellCore(int max_layers, int max_bufs, DoorbellFlag* go, DoorbellFlag* done, DoorbellFlag* ddone,
++               DoorbellFlag* arrived, int defer_mode)
++      : max_layers_(max_layers), max_bufs_(max_bufs), go_(go), done_(done), ddone_(ddone), arrived_(arrived),
++        defer_mode_(defer_mode) {
++    if (max_layers <= 0 || max_layers > 2 * kHalfStride || max_bufs <= 0) throw std::invalid_argument("CB-JOIN: sizes");
++    for (int l = 0; l < max_layers_; ++l) go_[l].v = done_[l].v = ddone_[l].v = 0;
++    if (arrived_) for (int l = 0; l < max_layers_; ++l) arrived_[l].v = 0;
++    layers_.resize(max_layers_);
++    echo_.assign(max_layers_, 0);
++    gpu_mask_.assign(max_layers_, nullptr);
++    expert_num_.assign(max_layers_, 0);
++    def_ids_.resize(max_layers_);
++    bufs_.resize(max_bufs_);
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++  }
++
++  static int pos_of(int j) { return 2 * (j % kHalfStride) + j / kHalfStride; }
++  static int idx_of(int p) { return p / 2 + kHalfStride * (p % 2); }
++
++  void check_layer(int j) const {
++    if (j < 0 || j >= max_layers_) throw std::out_of_range("CB-JOIN: layer out of range");
++  }
++
++  void register_layer(int j, std::shared_ptr<Moe> moe, const uint8_t* gpu_mask, int expert_num) {
++    check_layer(j);
++    if (!moe) throw std::invalid_argument("CB-JOIN: null MoE");
++    layers_[j] = moe;
++    gpu_mask_[j] = gpu_mask;
++    expert_num_[j] = expert_num;
++    publish(j);
++  }
++  void register_echo_layer(int j) {
++    check_layer(j);
++    echo_[j] = 1;
++    publish(j);
++  }
++
++  int register_buffer(const int* qlen, int k, const int64_t* ids, const float* weights, const void* input, void* output,
++                      void* def_output, int def_row_bytes) {
++    int id = n_bufs_.load(std::memory_order_relaxed);
++    if (id >= max_bufs_ || id >= (int)kBufMask) {
++      fprintf(stderr, "[CB-JOIN] FATAL: buffer table full (%d entries)\n", max_bufs_);
++      throw std::runtime_error("CB-JOIN: buffer table full");
++    }
++    bufs_[id] = Buf{qlen, k, ids, weights, input, output, def_output, def_row_bytes};
++    const int n = id + 1;
++    n_bufs_.store(n, std::memory_order_release);
++    if ((n & (n - 1)) == 0) {
++      printf("[CB-JOIN] buffer table: n_bufs=%d/%d\n", n, max_bufs_);
++      fflush(stdout);
++    }
++    if (n == max_bufs_ / 2 || n == (int)((long long)max_bufs_ * 9 / 10)) {
++      fprintf(stderr, "[CB-JOIN] WARNING: buffer table at %d%% (n_bufs=%d/%d)\n", n == max_bufs_ / 2 ? 50 : 90, n,
++              max_bufs_);
++      fflush(stderr);
++    }
++    return id;
++  }
++  int n_bufs() const { return n_bufs_.load(std::memory_order_acquire); }
++  int max_bufs() const { return max_bufs_; }
++  uint64_t tasks() const { return tasks_.load(std::memory_order_relaxed); }
++  uint64_t busy_ns() const { return busy_ns_.load(std::memory_order_relaxed); }
++  DeferStats defer_stats() const {
++    DeferStats s;
++    s.runs = d_runs_.load(std::memory_order_relaxed);
++    s.zero = d_zero_.load(std::memory_order_relaxed);
++    s.cpu_experts = d_cpu_.load(std::memory_order_relaxed);
++    s.busy_ns = d_ns_.load(std::memory_order_relaxed);
++    s.late = d_late_.load(std::memory_order_relaxed);
++    return s;
++  }
++
++  // One poller step. Returns true if a job ran.
++  bool poll_once() {
++    const int np = max_pos_.load(std::memory_order_acquire);
++    for (int s = 0; s < np; ++s) {
++      const int p = (next_p_ + s) % np;
++      const int j = idx_of(p);
++      if (j >= max_layers_ || !active_[j].load(std::memory_order_acquire)) continue;
++      const uint32_t v = go_[j].v;
++      if (v == 0) continue;
++      go_[j].v = 0;  // re-armed before done=1, so the next go cannot be lost
++      std::atomic_thread_fence(std::memory_order_acquire);
++      run_immediate(j, (v & kBufMask) - 1, (int)(v >> 20));
++      next_p_ = (p + 1) % np;
++      return true;
++    }
++    if (!defq_.empty()) {
++      const DefEntry e = defq_.front();
++      defq_.pop_front();
++      run_deferred(e);
++      return true;
++    }
++    return false;
++  }
++
++ private:
++  struct DefEntry {
++    int j;
++    uint32_t buf;
++    int qlen;
++    int n_cpu;
++  };
++
++  void publish(int j) {
++    active_[j].store(1, std::memory_order_release);
++    const int p1 = pos_of(j) + 1;
++    int prev = max_pos_.load(std::memory_order_relaxed);
++    while (p1 > prev && !max_pos_.compare_exchange_weak(prev, p1, std::memory_order_release)) {
++    }
++  }
++
++  Moe* moe_or_die(int j, uint32_t buf) {
++    Moe* moe = layers_[j].get();
++    if (moe == nullptr || (int)buf >= n_bufs_.load(std::memory_order_acquire)) {
++      fprintf(stderr, "[CB-JOIN] FATAL: go for layer %d with moe=%p buf=%u\n", j, (void*)moe, buf);
++      std::abort();  // a hang in cuStreamWaitValue32 would be worse than a crash
++    }
++    return moe;
++  }
++
++  template <class F>
++  void guarded(int j, const char* what, F&& f) {
++    try {
++      f();
++    } catch (const std::exception& ex) {
++      fprintf(stderr, "[CB-JOIN] FATAL: layer %d %s threw: %s\n", j, what, ex.what());
++      std::abort();
++    } catch (...) {
++      fprintf(stderr, "[CB-JOIN] FATAL: layer %d %s threw\n", j, what);
++      std::abort();
++    }
++  }
++
++  void signal(DoorbellFlag* f, int j) {
++    std::atomic_thread_fence(std::memory_order_release);
++    _mm_sfence();
++    f[j].v = 1;
++  }
++
++  void run_immediate(int j, uint32_t buf, int d) {
++    if (echo_[j]) {
++      tasks_.fetch_add(1, std::memory_order_relaxed);
++      signal(done_, j);
++      if (d > 0) signal(ddone_, j);
++      return;
++    }
++    Moe* moe = moe_or_die(j, buf);
++    const Buf& b = bufs_[buf];
++    auto t0 = std::chrono::steady_clock::now();
++    if (d == 0) {
++      // Existing path, unchanged: same call, same arrays
++      guarded(j, "forward", [&] { moe->forward(*b.qlen, b.k, b.ids, b.weights, b.input, b.output, false); });
++    } else {
++      if (b.def_output == nullptr) {
++        fprintf(stderr, "[CB-JOIN] FATAL: deferred go for layer %d on buffer %u without def_output\n", j, buf);
++        std::abort();
++      }
++      if (expert_num_[j] <= 0) {
++        fprintf(stderr, "[CB-JOIN] FATAL: deferred go for layer %d without expert_num (register_layer)\n", j);
++        std::abort();
++      }
++      const int qlen = *b.qlen;
++      const size_t n = (size_t)qlen * b.k;
++      imm_ids_.resize(n);
++      def_ids_[j].resize(n);
++      const int n_cpu = defer_split(b.ids, b.weights, qlen, b.k, d, defer_mode_, gpu_mask_[j], expert_num_[j],
++                                    imm_ids_.data(), def_ids_[j].data(), flag_);
++      guarded(j, "forward(imm)", [&] { moe->forward(qlen, b.k, imm_ids_.data(), b.weights, b.input, b.output, false); });
++      defq_.push_back(DefEntry{j, buf, qlen, n_cpu});
++    }
++    busy_ns_.fetch_add(ns_since(t0), std::memory_order_relaxed);
++    tasks_.fetch_add(1, std::memory_order_relaxed);
++    signal(done_, j);
++  }
++
++  void run_deferred(const DefEntry& e) {
++    const Buf& b = bufs_[e.buf];
++    auto t0 = std::chrono::steady_clock::now();
++    if (e.n_cpu == 0) {
++      std::memset(b.def_output, 0, (size_t)e.qlen * (size_t)b.def_row_bytes);
++      d_zero_.fetch_add(1, std::memory_order_relaxed);
++    } else {
++      Moe* moe = moe_or_die(e.j, e.buf);
++      guarded(e.j, "forward(def)",
++              [&] { moe->forward(e.qlen, b.k, def_ids_[e.j].data(), b.weights, b.input, b.def_output, false); });
++    }
++    d_ns_.fetch_add(ns_since(t0), std::memory_order_relaxed);
++    d_runs_.fetch_add(1, std::memory_order_relaxed);
++    d_cpu_.fetch_add((uint64_t)e.n_cpu, std::memory_order_relaxed);
++    if (arrived_ && arrived_[e.j].v != 0) d_late_.fetch_add(1, std::memory_order_relaxed);  // stream already waiting
++    signal(ddone_, e.j);
++  }
++
++  static uint64_t ns_since(std::chrono::steady_clock::time_point t0) {
++    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
++        .count();
++  }
++
++  const int max_layers_;
++  const int max_bufs_;
++  DoorbellFlag* go_;
++  DoorbellFlag* done_;
++  DoorbellFlag* ddone_;
++  DoorbellFlag* arrived_;
++  const int defer_mode_;
++  std::vector<std::shared_ptr<Moe>> layers_;
++  std::vector<const uint8_t*> gpu_mask_;
++  std::vector<int> expert_num_;
++  std::vector<int> echo_;
++  std::vector<Buf> bufs_;
++  std::atomic<int> active_[2 * kHalfStride] = {};
++  std::atomic<int> max_pos_{0};
++  std::atomic<int> n_bufs_{0};
++  int next_p_ = 0;
++  std::deque<DefEntry> defq_;
++  std::vector<int64_t> imm_ids_;
++  std::vector<std::vector<int64_t>> def_ids_;
++  std::vector<uint8_t> flag_;
++  std::atomic<uint64_t> tasks_{0}, busy_ns_{0};
++  std::atomic<uint64_t> d_runs_{0}, d_zero_{0}, d_cpu_{0}, d_ns_{0}, d_late_{0};
++};
++
++#endif  // CPUINFER_DOORBELL_CORE_H
+diff -ruN a/kt-kernel/cpu_backend/doorbell_join.h b/kt-kernel/cpu_backend/doorbell_join.h
+--- a/kt-kernel/cpu_backend/doorbell_join.h	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/cpu_backend/doorbell_join.h	2026-10-03 13:31:08.228318613 +0200
+@@ -0,0 +1,234 @@
++/**
++ * CB-JOIN: CPU<->GPU join per MoE layer without
++ * cudaLaunchHostFunc.
++ *
++ * The stock path puts two host nodes per layer on the stream
++ * (CPUInfer::submit_with_cuda_stream / sync_with_cuda_stream). Each one goes
++ * through the CUDA driver's callback thread, and the task hand-off adds two
++ * condition-variable wake-ups (TaskQueue::enqueue -> worker, worker ->
++ * sync_ callback). Decode is layer-serial, so all of that sits on the critical
++ * path 40 times per token.
++ *
++ * Here the stream itself signals and waits through stream memory operations on
++ * mapped pinned flags (one cache line per flag):
++ *   submit(l, buf): WriteValue32(done[l] = 0); WriteValue32(go[l] = buf + 1)
++ *   wait(l):        WaitValue32(done[l] == 1)
++ * and ONE spinning poller thread (no TaskQueue, no driver callback thread)
++ *   sees go[l] != 0 -> go[l] = 0 -> MoE_Interface::forward(...) -> done[l] = 1.
++ * Both memops are ordinary stream work, so they are recorded into CUDA graphs
++ * as memop nodes; the flag addresses are fixed for the life of the process.
++ * The arithmetic is exactly MoE_Interface::forward(qlen, k, ...,
++ * incremental=false), i.e. the same call the TaskQueue worker makes today:
++ * outputs must be bit-identical.
++ *
++ * Poller logic lives in
++ * doorbell_core.h (CUDA-free protocol state). Optional features (d = 0 and the old signatures remain bit-identical):
++ *   - deferral (KT_DS41_MU_DEFER_MHC): submit_defer(l, buf, d) -> ddone[l] = 0, [arrived[l] = 0], done[l] = 0, go = d<<20|buf+1;
++ *     the poller splits the top-k (defer_split.h), runs the immediate part -> done, later the deferred part into the
++ *     buffer's def_output -> ddone; wait_deferred(l) -> [arrived[l] = 1], WaitValue32(ddone[l] == 1).
++ *   - Dual micro-batching: index l = layer + 64 * half; the poller serves A_L before B_L before A_{L+1}.
++ */
++#ifndef CPUINFER_DOORBELL_JOIN_H
++#define CPUINFER_DOORBELL_JOIN_H
++
++#if defined(KTRANSFORMERS_USE_CUDA)
++
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <immintrin.h>
++#include <pthread.h>
++#include <sched.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <exception>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <tuple>
++#include <vector>
++
++#include "../operators/common.hpp"
++#include "doorbell_core.h"
++
++class DoorbellJoin {
++ public:
++  using Flag = DoorbellFlag;
++
++  // defer_mode: 0 = lowest-d of all top-k (like select_deferred_experts), 1 = lowest-d CPU experts only.
++  // defer_stats: 1 = arrived flags (stream marks "waiting for ddone") + one [CB-JOIN-DEFER] line per 60 s.
++  DoorbellJoin(int max_layers, int max_bufs, int poll_cpu, int defer_mode = 0, int defer_stats = 0)
++      : max_layers_(max_layers), poll_cpu_(poll_cpu), defer_stats_(defer_stats != 0) {
++    if (max_layers <= 0 || max_bufs <= 0) throw std::invalid_argument("CB-JOIN: sizes must be positive");
++    alloc_flags(&go_host_, &go_dev_);
++    alloc_flags(&done_host_, &done_dev_);
++    alloc_flags(&ddone_host_, &ddone_dev_);
++    if (defer_stats_) alloc_flags(&arrived_host_, &arrived_dev_);
++    core_ = std::make_unique<DoorbellCore<MoE_Interface>>(max_layers, max_bufs, go_host_, done_host_, ddone_host_,
++                                                          arrived_host_, defer_mode);
++    poller_ = std::thread(&DoorbellJoin::poll_loop, this);
++    printf("[CB-JOIN] poller started: max_layers=%d max_bufs=%d poll_cpu=%d (defer_mode=%d, defer_stats=%d)\n",
++           max_layers, max_bufs, poll_cpu_, defer_mode, (int)defer_stats_);
++    fflush(stdout);
++  }
++
++  ~DoorbellJoin() {
++    stop_.store(true, std::memory_order_release);
++    if (poller_.joinable()) poller_.join();
++    cudaFreeHost((void*)go_host_);
++    cudaFreeHost((void*)done_host_);
++    cudaFreeHost((void*)ddone_host_);
++    if (arrived_host_) cudaFreeHost((void*)arrived_host_);
++  }
++
++  DoorbellJoin(const DoorbellJoin&) = delete;
++  DoorbellJoin& operator=(const DoorbellJoin&) = delete;
++
++  // Called from Python before the layer's first submit (eager warm-up or graph capture). Keeps the MoE object alive.
++  // gpu_mask (uint8 per expert, 1 = GPU expert) and expert_num are needed only for deferred jobs.
++  void register_layer(int layer, std::shared_ptr<MoE_Interface> moe, intptr_t gpu_mask = 0, int expert_num = 0) {
++    core_->register_layer(layer, moe, (const uint8_t*)gpu_mask, expert_num);
++  }
++
++  // Toy/latency test only: a layer whose task does nothing (no MoE).
++  void register_echo_layer(int layer) { core_->register_echo_layer(layer); }
++
++  // One entry per pinned buffer slot (KExpertsCPUBuffer). Append-only (Python runs ahead of the stream, graphs bake
++  // ids). def_output/def_row_bytes: second output for deferred jobs (0 = buffer takes no deferred jobs).
++  int register_buffer(intptr_t qlen, int k, intptr_t ids, intptr_t weights, intptr_t input, intptr_t output,
++                      intptr_t def_output = 0, int def_row_bytes = 0) {
++    return core_->register_buffer((const int*)qlen, k, (const int64_t*)ids, (const float*)weights, (const void*)input,
++                                  (void*)output, (void*)def_output, def_row_bytes);
++  }
++
++  int n_bufs() const { return core_->n_bufs(); }
++  int max_bufs() const { return core_->max_bufs(); }
++
++  // Enqueue on `stream` AFTER the D2H copies of input/ids/weights.
++  void submit(intptr_t stream, int layer, int buf_id) { submit_defer(stream, layer, buf_id, 0); }
++
++  // d > 0: the poller defers the d lowest-weight experts (defer_split.h) into the buffer's def_output.
++  void submit_defer(intptr_t stream, int layer, int buf_id, int d) {
++    core_->check_layer(layer);
++    if (buf_id < 0 || buf_id >= core_->n_bufs()) throw std::invalid_argument("CB-JOIN: unknown buffer id");
++    if (d < 0 || d > 7) throw std::invalid_argument("CB-JOIN: defer count must be 0..7");
++    CUstream s = (CUstream)stream;
++    // default flags = system-wide memory barrier before the write, so the
++    // preceding D2H copies are visible before the CPU can see go[layer].
++    if (d > 0) {
++      check(cuStreamWriteValue32(s, flag_dev(ddone_dev_, layer), 0, CU_STREAM_WRITE_VALUE_DEFAULT),
++            "cuStreamWriteValue32(ddone=0)");
++      if (defer_stats_)
++        check(cuStreamWriteValue32(s, flag_dev(arrived_dev_, layer), 0, CU_STREAM_WRITE_VALUE_DEFAULT),
++              "cuStreamWriteValue32(arrived=0)");
++    }
++    check(cuStreamWriteValue32(s, flag_dev(done_dev_, layer), 0, CU_STREAM_WRITE_VALUE_DEFAULT),
++          "cuStreamWriteValue32(done=0)");
++    check(cuStreamWriteValue32(s, flag_dev(go_dev_, layer), ((cuuint32_t)d << 20) | (cuuint32_t)(buf_id + 1),
++                               CU_STREAM_WRITE_VALUE_DEFAULT),
++          "cuStreamWriteValue32(go)");
++  }
++
++  // Enqueue on `stream` BEFORE the H2D copy of the CPU output.
++  void wait(intptr_t stream, int layer) {
++    core_->check_layer(layer);
++    check(cuStreamWaitValue32((CUstream)stream, flag_dev(done_dev_, layer), 1, CU_STREAM_WAIT_VALUE_EQ),
++          "cuStreamWaitValue32(done==1)");
++  }
++
++  // Enqueue on `stream` BEFORE the H2D copy of the deferred output (attention hc_post of the next layer).
++  void wait_deferred(intptr_t stream, int layer) {
++    core_->check_layer(layer);
++    if (defer_stats_)
++      check(cuStreamWriteValue32((CUstream)stream, flag_dev(arrived_dev_, layer), 1, CU_STREAM_WRITE_VALUE_DEFAULT),
++            "cuStreamWriteValue32(arrived=1)");
++    check(cuStreamWaitValue32((CUstream)stream, flag_dev(ddone_dev_, layer), 1, CU_STREAM_WAIT_VALUE_EQ),
++          "cuStreamWaitValue32(ddone==1)");
++  }
++
++  uint64_t tasks() const { return core_->tasks(); }
++  uint64_t busy_ns() const { return core_->busy_ns(); }
++  // (runs, zero-filled, deferred CPU experts, busy ns, late = stream was already waiting)
++  std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t> defer_stats() const {
++    auto s = core_->defer_stats();
++    return {s.runs, s.zero, s.cpu_experts, s.busy_ns, s.late};
++  }
++
++ private:
++  static void check(CUresult r, const char* what) {
++    if (r != CUDA_SUCCESS) {
++      const char* s = nullptr;
++      cuGetErrorString(r, &s);
++      throw std::runtime_error(std::string("CB-JOIN ") + what + ": " + (s ? s : "unknown CUDA error"));
++    }
++  }
++
++  static CUdeviceptr flag_dev(CUdeviceptr base, int layer) { return base + (CUdeviceptr)layer * sizeof(Flag); }
++
++  void alloc_flags(Flag** host, CUdeviceptr* dev) {
++    void* p = nullptr;
++    cudaError_t e = cudaHostAlloc(&p, sizeof(Flag) * (size_t)max_layers_, cudaHostAllocMapped | cudaHostAllocPortable);
++    if (e != cudaSuccess) throw std::runtime_error(std::string("CB-JOIN cudaHostAlloc: ") + cudaGetErrorString(e));
++    void* d = nullptr;
++    e = cudaHostGetDevicePointer(&d, p, 0);
++    if (e != cudaSuccess) throw std::runtime_error(std::string("CB-JOIN cudaHostGetDevicePointer: ") + cudaGetErrorString(e));
++    *host = (Flag*)p;
++    *dev = (CUdeviceptr)(uintptr_t)d;
++  }
++
++  void poll_loop() {
++    if (poll_cpu_ >= 0) {
++      cpu_set_t set;
++      CPU_ZERO(&set);
++      CPU_SET(poll_cpu_, &set);
++      pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
++    }
++    pthread_setname_np(pthread_self(), "kt_cb_join");
++    auto last = std::chrono::steady_clock::now();
++    auto last_log = last;
++    uint64_t logged_runs = 0;
++    while (!stop_.load(std::memory_order_acquire)) {
++      if (core_->poll_once()) {
++        last = std::chrono::steady_clock::now();
++      } else {
++        _mm_pause();
++        // Spin like the pool workers (50 ms), then poll every 20 us while idle.
++        auto now = std::chrono::steady_clock::now();
++        if (now - last > std::chrono::milliseconds(50)) std::this_thread::sleep_for(std::chrono::microseconds(20));
++        if (defer_stats_ && now - last_log > std::chrono::seconds(60)) {
++          last_log = now;
++          auto s = core_->defer_stats();
++          if (s.runs != logged_runs) {
++            logged_runs = s.runs;
++            printf("[CB-JOIN-DEFER] runs=%lu zero=%lu cpu_experts_per_run=%.3f def_us_mean=%.1f late=%.2f%%\n",
++                   (unsigned long)s.runs, (unsigned long)s.zero, s.runs ? (double)s.cpu_experts / s.runs : 0.0,
++                   s.runs ? (double)s.busy_ns / s.runs / 1000.0 : 0.0, s.runs ? 100.0 * s.late / s.runs : 0.0);
++            fflush(stdout);
++          }
++        }
++      }
++    }
++  }
++
++  const int max_layers_;
++  const int poll_cpu_;
++  const bool defer_stats_;
++  Flag* go_host_ = nullptr;
++  Flag* done_host_ = nullptr;
++  Flag* ddone_host_ = nullptr;
++  Flag* arrived_host_ = nullptr;
++  CUdeviceptr go_dev_ = 0;
++  CUdeviceptr done_dev_ = 0;
++  CUdeviceptr ddone_dev_ = 0;
++  CUdeviceptr arrived_dev_ = 0;
++  std::unique_ptr<DoorbellCore<MoE_Interface>> core_;
++  std::atomic<bool> stop_{false};
++  std::thread poller_;
++};
++
++#endif  // KTRANSFORMERS_USE_CUDA
++#endif  // CPUINFER_DOORBELL_JOIN_H
+diff -ruN a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+--- a/kt-kernel/ext_bindings.cpp	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/ext_bindings.cpp	2026-10-03 13:31:08.228085188 +0200
+@@ -20,6 +20,7 @@
+ #include <cstring>
+ 
+ #include "cpu_backend/cpuinfer.h"
++#include "cpu_backend/doorbell_join.h"  // CB-JOIN: stream memory operations replace host callbacks
+ #include "cpu_backend/worker_pool.h"
+ #include "operators/common.hpp"
+ 
+@@ -544,6 +545,13 @@
+ #endif
+   m.attr("__fp8_weight_layout__") = "block-e4m3-128x128";
+ 
++  // Stream-prefill writer layout flags (bit 0: up-first, bit 1: E8M0 scales). For f < 0, read the flags; otherwise atomically replace them and return the previous value.
++#if defined(__x86_64__)
++  m.def(
++      "stream_write_flags",
++      [](int f) { return f < 0 ? ktstream::write_flags() : ktstream::g_write_flags.exchange(f); },
++      py::arg("flags") = -1);
++#endif
+   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
+       .def(py::init<>())
+@@ -556,6 +564,8 @@
+       .def(py::init<WorkerPoolConfig>())
+       .def("submit", &CPUInfer::submit)
+       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
++      // Wait without holding the GIL on the stream-prefill writer thread.
++      .def("sync_nogil", &CPUInfer::sync, py::arg("allow_n_pending") = 0, py::call_guard<py::gil_scoped_release>())
+       .def_readwrite("backend_", &CPUInfer::backend_)
+ #ifndef KTRANSFORMERS_CPU_ONLY
+       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
+@@ -852,6 +862,29 @@
+       .DEF_PTR_PROPERTY(MOESFTConfig, grad_down_proj);
+ 
+   py::class_<MoE_Interface, std::shared_ptr<MoE_Interface>>(moe_module, "MoE_Interface");
++#if defined(KTRANSFORMERS_USE_CUDA)
++  // CB-JOIN: opt-in replacement for submit/sync_with_cuda_stream.
++  py::class_<DoorbellJoin, std::shared_ptr<DoorbellJoin>>(m, "DoorbellJoin")
++      .def(py::init<int, int, int, int, int>(), py::arg("max_layers") = 128, py::arg("max_bufs") = 65536,
++           py::arg("poll_cpu") = -1, py::arg("defer_mode") = 0, py::arg("defer_stats") = 0)
++      .def("register_layer", &DoorbellJoin::register_layer, py::arg("layer"), py::arg("moe"), py::arg("gpu_mask") = 0,
++           py::arg("expert_num") = 0)
++      .def("register_echo_layer", &DoorbellJoin::register_echo_layer, py::arg("layer"))
++      .def("register_buffer", &DoorbellJoin::register_buffer, py::arg("qlen_ptr"), py::arg("k"),
++           py::arg("ids_ptr"), py::arg("weights_ptr"), py::arg("input_ptr"), py::arg("output_ptr"),
++           py::arg("def_output_ptr") = 0, py::arg("def_row_bytes") = 0)
++      .def("submit", &DoorbellJoin::submit, py::arg("cuda_stream"), py::arg("layer"), py::arg("buf_id"))
++      // Deferred execution with a separate completion wait.
++      .def("submit_defer", &DoorbellJoin::submit_defer, py::arg("cuda_stream"), py::arg("layer"), py::arg("buf_id"),
++           py::arg("d"))
++      .def("wait", &DoorbellJoin::wait, py::arg("cuda_stream"), py::arg("layer"))
++      .def("wait_deferred", &DoorbellJoin::wait_deferred, py::arg("cuda_stream"), py::arg("layer"))
++      .def("tasks", &DoorbellJoin::tasks)
++      .def("n_bufs", &DoorbellJoin::n_bufs)
++      .def("max_bufs", &DoorbellJoin::max_bufs)
++      .def("busy_ns", &DoorbellJoin::busy_ns)
++      .def("defer_stats", &DoorbellJoin::defer_stats);
++#endif
+ 
+   bind_moe_module<LLAMA_MOE_TP>(moe_module, "MOE");
+ 
+@@ -1064,7 +1097,7 @@
+ 
+   auto utils = m.def_submodule("utils");
+ 
+-  // 注册转换函数
++  // Register conversion functions.
+   utils.def("to_float", &to_float_ptr, "Convert tensor from any GGML type to float32", py::arg("input"),
+             py::arg("size"), py::arg("type"));
+ 
+@@ -1074,7 +1107,7 @@
+ 
+ #if defined(KTRANSFORMERS_ENABLE_CPPTRACE)
+ static void warmup_cpptrace() {
+-  // 避免第一次调用触发 lazy-loading（malloc 等） :contentReference[oaicite:7]{index=7}
++  // Warm up trace generation to avoid lazy loading (e.g. allocation) on the first call.
+   cpptrace::frame_ptr buffer[10];
+   (void)cpptrace::safe_generate_raw_trace(buffer, 10);
+   cpptrace::safe_object_frame frame{};
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-kernel.hpp b/kt-kernel/operators/avx2/mxfp4-kernel.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-kernel.hpp	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/operators/avx2/mxfp4-kernel.hpp	2026-10-03 13:31:08.229047358 +0200
+@@ -0,0 +1,363 @@
++/**
++ * @Description: AVX2 MXFP4 single-row decode GEMV kernel for Zen 2.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * KT_DS41_MU_MXFP4_KERNEL=1: exact path. Per output row the arithmetic is IDENTICAL to the legacy single-row
++ * loop in gemm_mxfp4 (group_size 32): same FP4 -> fp32 values, same column -> lane mapping
++ * (w0 = cols {0,2,4,6|1,3,5,7}, w1 = {8..14|9..15}, w2, w3), same MUL/FMA order inside a group, same
++ * even/odd group accumulators, same hsum. Output is therefore bit-identical for every input.
++ * Differences are only in HOW the values are produced / scheduled:
++ *   - activation permuted once per expert (even/odd split per 8, no shuffles) instead of once per task,
++ *   - several output rows interleaved (independent dependency chains for the out-of-order core),
++ *   - cheaper decode: byte permutation + AND/shift widening instead of 4 x unpack16 (DEC=1/2).
++ **/
++#ifndef CPUINFER_OPERATOR_AVX2_MXFP4_KERN_H
++#define CPUINFER_OPERATOR_AVX2_MXFP4_KERN_H
++
++#include <immintrin.h>
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include "avx2_bf16_utils.hpp"
++
++namespace avx2kern {
++
++// Env switches, read once per process.
++static inline int env_int(const char* name, int dflt) {
++  const char* s = std::getenv(name);
++  return (s && *s) ? std::atoi(s) : dflt;
++}
++static inline int kern_mode() {
++  static const int m = env_int("KT_DS41_MU_MXFP4_KERNEL", 0);
++  return m;
++}
++// Compact E8M0 copy of the group scales, used only by the KERN path (requires KT_DS41_MU_MXFP4_KERNEL >= 1).
++static inline bool e8m0_mode() {
++  static const bool m = env_int("KT_DS41_MU_MXFP4_E8M0", 0) != 0;
++  return m;
++}
++
++// FP4 E2M1 -> BF16 byte tables (identical to GemmKernelAVX2MXFP4::fp4_bf16_lo/hi)
++alignas(16) static constexpr uint8_t kLutLo[16] = {0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
++                                                   0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
++alignas(16) static constexpr uint8_t kLutHi[16] = {0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
++                                                   0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
++// Byte permutation so that the even/odd word split after unpack8 reproduces the legacy lane mapping.
++alignas(32) static constexpr uint8_t kBytePerm[32] = {0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15,
++                                                      0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15};
++
++// BF16 activation -> FP32 in the legacy kGroupPerm order ({0,2,4,6,1,3,5,7} per 8). k % 8 == 0.
++static inline void permute_act_bf16(const ggml_bf16_t* src, float* dst, int k) {
++  const __m256i hm = _mm256_set1_epi32((int)0xFFFF0000u);
++  int i = 0;
++  for (; i + 16 <= k; i += 16) {
++    __m256i x = _mm256_loadu_si256((const __m256i*)(src + i));
++    __m256i ev = _mm256_slli_epi32(x, 16);  // lanes: src 0,2,4,6 | 8,10,12,14
++    __m256i od = _mm256_and_si256(x, hm);   // lanes: src 1,3,5,7 | 9,11,13,15
++    _mm_storeu_si128((__m128i*)(dst + i), _mm256_castsi256_si128(ev));
++    _mm_storeu_si128((__m128i*)(dst + i + 4), _mm256_castsi256_si128(od));
++    _mm_storeu_si128((__m128i*)(dst + i + 8), _mm256_extracti128_si256(ev, 1));
++    _mm_storeu_si128((__m128i*)(dst + i + 12), _mm256_extracti128_si256(od, 1));
++  }
++  for (; i + 8 <= k; i += 8) {
++    __m128i x = _mm_loadu_si128((const __m128i*)(src + i));
++    _mm_storeu_si128((__m128i*)(dst + i), _mm_slli_epi32(x, 16));
++    _mm_storeu_si128((__m128i*)(dst + i + 4), _mm_and_si128(x, _mm256_castsi256_si128(hm)));
++  }
++}
++
++struct KConst {
++  __m256i lutlo, luthi, nib, zero, himask, perm256;
++  __m128i nib128, perm128;
++  KConst() {
++    const __m128i lo = _mm_load_si128((const __m128i*)kLutLo);
++    const __m128i hi = _mm_load_si128((const __m128i*)kLutHi);
++    lutlo = _mm256_broadcastsi128_si256(lo);
++    luthi = _mm256_broadcastsi128_si256(hi);
++    nib = _mm256_set1_epi8(0x0F);
++    nib128 = _mm_set1_epi8(0x0F);
++    zero = _mm256_setzero_si256();
++    himask = _mm256_set1_epi32((int)0xFFFF0000u);
++    perm256 = _mm256_load_si256((const __m256i*)kBytePerm);
++    perm128 = _mm256_castsi256_si128(perm256);
++  }
++};
++
++// Decode one 32-value group at p into w0..w3 (legacy lane mapping). DEC selects the method.
++template <int DEC>
++static __attribute__((always_inline)) inline void decode_group(const uint8_t* p, const KConst& K, __m256& w0, __m256& w1,
++                                                                 __m256& w2, __m256& w3) {
++  if constexpr (DEC == 0) {  // legacy: 9 shuffles
++    const __m128i raw = _mm_loadu_si128((const __m128i*)p);
++    const __m128i lo = _mm_and_si128(raw, K.nib128);
++    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), K.nib128);
++    const __m256i v = _mm256_set_m128i(hi, lo);
++    const __m256i bl = _mm256_shuffle_epi8(K.lutlo, v);
++    const __m256i bh = _mm256_shuffle_epi8(K.luthi, v);
++    const __m256i ua = _mm256_unpacklo_epi8(bl, bh);
++    const __m256i ub = _mm256_unpackhi_epi8(bl, bh);
++    w0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(K.zero, ua));
++    w1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(K.zero, ua));
++    w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(K.zero, ub));
++    w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(K.zero, ub));
++  } else {
++    __m256i v;
++    if constexpr (DEC == 1) {  // xmm byte permutation + vinserti128: 6 shuffles
++      const __m128i raw = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p), K.perm128);
++      const __m128i lo = _mm_and_si128(raw, K.nib128);
++      const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), K.nib128);
++      v = _mm256_set_m128i(hi, lo);
++    } else {  // DEC == 2: broadcast load + blend (no insert), permutation on the index vector: 5 shuffles
++      const __m256i r = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)p));
++      const __m256i t = _mm256_blend_epi32(r, _mm256_srli_epi16(r, 4), 0xF0);
++      v = _mm256_shuffle_epi8(_mm256_and_si256(t, K.nib), K.perm256);
++    }
++    const __m256i bl = _mm256_shuffle_epi8(K.lutlo, v);
++    const __m256i bh = _mm256_shuffle_epi8(K.luthi, v);
++    const __m256i ua = _mm256_unpacklo_epi8(bl, bh);
++    const __m256i ub = _mm256_unpackhi_epi8(bl, bh);
++    w0 = _mm256_castsi256_ps(_mm256_slli_epi32(ua, 16));
++    w1 = _mm256_castsi256_ps(_mm256_and_si256(ua, K.himask));
++    w2 = _mm256_castsi256_ps(_mm256_slli_epi32(ub, 16));
++    w3 = _mm256_castsi256_ps(_mm256_and_si256(ub, K.himask));
++  }
++}
++
++// Exact m = 1 GEMV over rows [n0, n1): c[ni] = row(ni) . a  (legacy arithmetic per row).
++//   ap : activation, fp32, legacy-permuted (permute_act_bf16), length k
++//   b  : nibble rows, k/2 bytes each;  d : fp32 group scales, k/32 per row
++//   ROWS rows are processed together (independent chains), PFD = software prefetch distance (bytes, 0 = off)
++template <int ROWS, int DEC, int PFD>
++static void gemv_exact(const float* __restrict ap, const uint8_t* __restrict b, const float* __restrict d, int k, int n0,
++                       int n1, float* __restrict c) {
++  static const KConst K;
++  const int G = k / 32;
++  const size_t rb = (size_t)k / 2;
++  int ni = n0;
++  for (; ni + ROWS <= n1; ni += ROWS) {
++    const uint8_t* br[ROWS];
++    const float* sr[ROWS];
++    __m256 t0[ROWS], t1[ROWS];
++#pragma GCC unroll 8
++    for (int r = 0; r < ROWS; r++) {
++      br[r] = b + (size_t)(ni + r) * rb;
++      sr[r] = d + (size_t)(ni + r) * G;
++      t0[r] = _mm256_setzero_ps();
++      t1[r] = _mm256_setzero_ps();
++    }
++    auto step = [&](int g, __m256* tacc) __attribute__((always_inline)) {
++      const float* a = ap + (size_t)g * 32;
++      const __m256 a0 = _mm256_loadu_ps(a), a1 = _mm256_loadu_ps(a + 8);
++      const __m256 a2 = _mm256_loadu_ps(a + 16), a3 = _mm256_loadu_ps(a + 24);
++#pragma GCC unroll 8
++      for (int r = 0; r < ROWS; r++) {
++        if constexpr (PFD > 0) {
++          if ((g & 3) == 0) _mm_prefetch((const char*)(br[r] + (size_t)g * 16 + PFD), _MM_HINT_T0);
++          if ((g & 15) == 0) _mm_prefetch((const char*)(sr[r] + g + PFD / 4), _MM_HINT_T0);
++        }
++        __m256 w0, w1, w2, w3;
++        decode_group<DEC>(br[r] + (size_t)g * 16, K, w0, w1, w2, w3);
++        __m256 gacc = _mm256_mul_ps(a0, w0);
++        gacc = _mm256_fmadd_ps(a1, w1, gacc);
++        gacc = _mm256_fmadd_ps(a2, w2, gacc);
++        gacc = _mm256_fmadd_ps(a3, w3, gacc);
++        tacc[r] = _mm256_fmadd_ps(gacc, _mm256_broadcast_ss(sr[r] + g), tacc[r]);
++      }
++    };
++    int g = 0;
++    for (; g + 2 <= G; g += 2) {
++      step(g, t0);
++      step(g + 1, t1);
++    }
++    if (g < G) step(g, t0);
++#pragma GCC unroll 8
++    for (int r = 0; r < ROWS; r++) c[ni + r] = avx2::hsum_avx2(_mm256_add_ps(t0[r], t1[r]));
++  }
++  if constexpr (ROWS > 1) {
++    if (ni < n1) gemv_exact<1, DEC, PFD>(ap, b, d, k, ni, n1, c);
++  }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Production kernel: M activation rows (M = 1..3) against weight rows [n0, n1), one weight row at a time,
++// legacy decode (DEC 0), no software prefetch (measured best cold on Zen 2, Block 3).
++// Scales: fp32 (E8 = false, d = float*) or e8m0 exponent bytes (E8 = true, d = uint8_t*, value 2^(e-127)
++// from a table -> the very same fp32 value, so the result stays bit-identical).
++// Per (row, activation) the arithmetic equals the legacy single-row loop of gemm_mxfp4 (used there for m <= 3).
++//   ap : M activation rows, each k fp32 in legacy permuted order, row stride ap_stride
++//   c  : output, c[mi * c_stride + ni]
++struct E8Tab {
++  alignas(64) float v[256];
++  E8Tab() {
++    for (int e = 0; e < 255; e++) {
++      uint32_t bits = e == 0 ? 0x00400000u : ((uint32_t)e << 23);  // e = 0 -> 2^-127 (subnormal), exact
++      std::memcpy(&v[e], &bits, 4);
++    }
++    uint32_t nan = 0x7FC00000u;
++    std::memcpy(&v[255], &nan, 4);
++  }
++};
++static inline const float* e8_table() {
++  static const E8Tab t;
++  return t.v;
++}
++
++template <int M, bool E8>
++static void gemv_m(const float* __restrict ap, size_t ap_stride, const uint8_t* __restrict b, const void* __restrict dv,
++                   int k, int n0, int n1, float* __restrict c, size_t c_stride) {
++  static const KConst K;
++  const float* e8 = e8_table();
++  const int G = k / 32;
++  const size_t rb = (size_t)k / 2;
++  for (int ni = n0; ni < n1; ni++) {
++    const uint8_t* br = b + (size_t)ni * rb;
++    const float* sf = E8 ? nullptr : (const float*)dv + (size_t)ni * G;
++    const uint8_t* se = E8 ? (const uint8_t*)dv + (size_t)ni * G : nullptr;
++    __m256 t0[M], t1[M];
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) t0[mi] = t1[mi] = _mm256_setzero_ps();
++    auto step = [&](int g, __m256* tacc) __attribute__((always_inline)) {
++      __m256 w0, w1, w2, w3;
++      decode_group<0>(br + (size_t)g * 16, K, w0, w1, w2, w3);
++      const __m256 sv = E8 ? _mm256_broadcast_ss(e8 + se[g]) : _mm256_broadcast_ss(sf + g);
++#pragma GCC unroll 4
++      for (int mi = 0; mi < M; mi++) {
++        const float* a = ap + mi * ap_stride + (size_t)g * 32;
++        __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(a), w0);
++        gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 8), w1, gacc);
++        gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 16), w2, gacc);
++        gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 24), w3, gacc);
++        tacc[mi] = _mm256_fmadd_ps(gacc, sv, tacc[mi]);
++      }
++    };
++    int g = 0;
++    for (; g + 2 <= G; g += 2) {
++      step(g, t0);
++      step(g + 1, t1);
++    }
++    if (g < G) step(g, t0);
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) c[mi * c_stride + ni] = avx2::hsum_avx2(_mm256_add_ps(t0[mi], t1[mi]));
++  }
++}
++
++// e8m0 exponent byte of an exact power-of-two fp32 scale, or -1 if not representable (fallback fp32).
++static inline int f32_to_e8m0_exact(float f) {
++  uint32_t u;
++  std::memcpy(&u, &f, 4);
++  if (u == 0x00400000u) return 0;                    // 2^-127
++  if ((u & 0x807FFFFFu) != 0) return -1;             // sign or mantissa bits set, subnormal other than 2^-127
++  const int e = (int)(u >> 23);
++  if (e == 0 || e == 255) return -1;                 // zero / inf / nan
++  return e;
++}
++
++
++// =============================================================================================
++// KERN=2 (KT_DS41_MU_MXFP4_KERNEL=2): Q8 activation (int8 per 32-block, fp32 block scale amax/127) and int8
++// weights via LUT (FP4 E2M1 x 2), vpsignb / vpmaddubsw / vpmaddwd like llama.cpp mxfp4 x q8_0.
++// NOT bit-identical to the fp32 path (activation is quantized, as in the GPU W4A8 path); gates needed.
++// Layout of the quantized activation per 32-group: bytes 0..15 = cols 0,2,..,30, bytes 16..31 = cols 1,3,..,31
++// (matches the natural nibble split lo | hi of the weight bytes), plus da_half[g] = amax / 127 * 0.5.
++alignas(16) static constexpr int8_t kLutI8[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
++
++static inline void quant_act_q8(const ggml_bf16_t* src, int k, int8_t* q, float* da_half) {
++  const __m256i hm = _mm256_set1_epi32((int)0xFFFF0000u);
++  const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
++  const __m256i pidx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
++  const int G = k / 32;
++  for (int g = 0; g < G; g++) {
++    const __m256i xa = _mm256_loadu_si256((const __m256i*)(src + (size_t)g * 32));
++    const __m256i xb = _mm256_loadu_si256((const __m256i*)(src + (size_t)g * 32 + 16));
++    const __m256 ea = _mm256_castsi256_ps(_mm256_slli_epi32(xa, 16));
++    const __m256 oa = _mm256_castsi256_ps(_mm256_and_si256(xa, hm));
++    const __m256 eb = _mm256_castsi256_ps(_mm256_slli_epi32(xb, 16));
++    const __m256 ob = _mm256_castsi256_ps(_mm256_and_si256(xb, hm));
++    __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_and_ps(ea, absm), _mm256_and_ps(oa, absm)),
++                             _mm256_max_ps(_mm256_and_ps(eb, absm), _mm256_and_ps(ob, absm)));
++    m = _mm256_max_ps(m, _mm256_permute2f128_ps(m, m, 1));
++    m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0x4E));
++    m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0xB1));
++    const float amax = _mm256_cvtss_f32(m);
++    if (!(amax > 0.0f)) {
++      _mm256_storeu_si256((__m256i*)(q + (size_t)g * 32), _mm256_setzero_si256());
++      da_half[g] = 0.0f;
++      continue;
++    }
++    const __m256 inv = _mm256_div_ps(_mm256_set1_ps(127.0f), m);
++    const __m256i qea = _mm256_cvtps_epi32(_mm256_mul_ps(ea, inv));
++    const __m256i qoa = _mm256_cvtps_epi32(_mm256_mul_ps(oa, inv));
++    const __m256i qeb = _mm256_cvtps_epi32(_mm256_mul_ps(eb, inv));
++    const __m256i qob = _mm256_cvtps_epi32(_mm256_mul_ps(ob, inv));
++    const __m256i pe = _mm256_packs_epi32(qea, qeb);
++    const __m256i po = _mm256_packs_epi32(qoa, qob);
++    const __m256i b = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(pe, po), pidx);
++    _mm256_storeu_si256((__m256i*)(q + (size_t)g * 32), b);
++    da_half[g] = amax / 127.0f * 0.5f;
++  }
++}
++
++// M activation rows (q8 + da_half, row strides k bytes / k/32 floats) against weight rows [n0, n1).
++template <int M, bool E8>
++static void gemv_q8(const int8_t* __restrict q, const float* __restrict da, const uint8_t* __restrict b,
++                    const void* __restrict dv, int k, int n0, int n1, float* __restrict c, size_t c_stride) {
++  const __m256i lut = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)kLutI8));
++  const __m128i nib = _mm_set1_epi8(0x0F);
++  const __m256i ones = _mm256_set1_epi16(1);
++  const float* e8 = e8_table();
++  const int G = k / 32;
++  const size_t rb = (size_t)k / 2;
++  for (int ni = n0; ni < n1; ni++) {
++    const uint8_t* br = b + (size_t)ni * rb;
++    const float* sf = E8 ? nullptr : (const float*)dv + (size_t)ni * G;
++    const uint8_t* se = E8 ? (const uint8_t*)dv + (size_t)ni * G : nullptr;
++    __m256 acc[M][4];
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++)
++      for (int j = 0; j < 4; j++) acc[mi][j] = _mm256_setzero_ps();
++    auto step = [&](int g, int j) __attribute__((always_inline)) {
++      const __m128i raw = _mm_loadu_si128((const __m128i*)(br + (size_t)g * 16));
++      const __m256i v = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(raw, 4), nib), _mm_and_si128(raw, nib));
++      const __m256i w8 = _mm256_shuffle_epi8(lut, v);
++      const __m256i aw = _mm256_sign_epi8(w8, w8);
++      const __m256 ws = E8 ? _mm256_broadcast_ss(e8 + se[g]) : _mm256_broadcast_ss(sf + g);
++#pragma GCC unroll 4
++      for (int mi = 0; mi < M; mi++) {
++        const __m256i qa = _mm256_loadu_si256((const __m256i*)(q + (size_t)mi * k + (size_t)g * 32));
++        const __m256i p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(qa, w8));
++        const __m256 f = _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones));
++        // Combined scale first: da * ws is exact (ws is a power of two), so the result is a single rounding
++        // acc + f * da * ws. Written as fma(f, sc, acc) so -ffast-math cannot re-associate it differently
++        // per instantiation. The former order (mul(f, da), then fma(., ws, .)) was folded differently by GCC for M / E8.
++        const __m256 sc = _mm256_mul_ps(_mm256_broadcast_ss(da + (size_t)mi * G + g), ws);
++        acc[mi][j] = _mm256_fmadd_ps(f, sc, acc[mi][j]);
++      }
++    };
++    int g = 0;
++    for (; g + 4 <= G; g += 4) {
++      step(g, 0);
++      step(g + 1, 1);
++      step(g + 2, 2);
++      step(g + 3, 3);
++    }
++    for (int j = 0; g < G; g++, j++) step(g, j);
++    // Fixed reduction order ((a0 + a1) + (a2 + a3)); the empty asm pins each partial sum so that -ffast-math
++    // cannot re-associate the 4-way sum differently per instantiation (M, E8), which otherwise made results batch-dependent.
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) {
++      __m256 s01 = _mm256_add_ps(acc[mi][0], acc[mi][1]);
++      __asm__("" : "+x"(s01));
++      __m256 s23 = _mm256_add_ps(acc[mi][2], acc[mi][3]);
++      __asm__("" : "+x"(s23));
++      __m256 s = _mm256_add_ps(s01, s23);
++      __asm__("" : "+x"(s));
++      c[mi * c_stride + ni] = avx2::hsum_avx2(s);
++    }
++  }
++}
++
++}  // namespace avx2kern
++
++#endif  // CPUINFER_OPERATOR_AVX2_MXFP4_KERN_H
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-03 07:11:42.296516743 +0200
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-03 13:31:08.228647239 +0200
+@@ -25,6 +25,38 @@
+ #include "avx2_bf16_gemm.hpp"
+ #include "avx2_bf16_utils.hpp"
+ #include "moe_base.hpp"
++#include "mxfp4-kernel.hpp"  // AVX2 MXFP4 decode kernel and E8M0 scale paths
++
++#include <atomic>
++
++// Stream-prefill writer layout flags:
++// (write_weights_to_buffer). 0 = unchanged kt-kernel layout ([gate; up], bf16 scales).
++//   bit 0 (KT_WRITE_UP_FIRST=1): w13 as [up; gate], the FlashInfer CUTLASS order -> one DMA per group.
++//   bit 1 (KT_DS41_MU_STREAM_E8M0=1):   scales as e8m0 bytes instead of bf16. Byte = (bf16(d) >> 7) & 0xFF, i.e. what the
++//                                consumer's _bf16_to_ue8m0 made of the bf16 scale; taken from the E8M0 copy (bb.e8)
++//                                where it exists, else computed through the same fp32->bf16 conversion.
++// Read once from the environment; kt_kernel_ext.stream_write_flags(f) overrides the flags.
++namespace ktstream {
++inline int flags_from_env() {
++  auto on = [](const char* n) { const char* s = std::getenv(n); return s && s[0] == '1'; };
++  return (on("KT_WRITE_UP_FIRST") ? 1 : 0) | (on("KT_DS41_MU_STREAM_E8M0") ? 2 : 0);
++}
++inline std::atomic<int> g_write_flags{flags_from_env()};
++inline int write_flags() { return g_write_flags.load(std::memory_order_relaxed); }
++// cnt scales of one matrix, starting at element off, as e8m0 bytes.
++inline void put_e8m0(uint8_t* dst, const uint8_t* e8, const float* d, size_t off, size_t cnt) {
++  if (e8 != nullptr) {
++    std::memcpy(dst, e8 + off, cnt);
++    return;
++  }
++  ggml_bf16_t tmp[256];
++  for (size_t i = 0; i < cnt; i += 256) {
++    const size_t n = std::min<size_t>(256, cnt - i);
++    ggml_fp32_to_bf16_row(d + off + i, tmp, (int64_t)n);
++    for (size_t j = 0; j < n; j++) dst[i + j] = (uint8_t)((tmp[j].bits >> 7) & 0xFF);
++  }
++}
++}  // namespace ktstream
+ 
+ namespace avx2 {
+ 
+@@ -106,15 +138,17 @@
+   struct BufferA {
+     ggml_bf16_t* data = nullptr;
+     // Pre-permuted FP32 copy of the same rows (null when k % 32 != 0). Filled
+-    // once per expert by from_mat; before 09-13 every gemm_mxfp4 call — one
++    // once per expert by from_mat; previously, every gemm_mxfp4 call—one
+     // per 64-row weight slice, 36-80 per expert — redid this conversion for
+     // the whole m x k block, which was ~40% of a prefill task.
+     float* perm = nullptr;
+     // Rows the pre-permuted copy holds. Filled by from_mat only for prefill-
+     // sized inputs: writing and reading it for the 1-8 rows of a decode step
+-    // cost 13% of Flash-Next decode (09-14, 36.4 -> 31.7 tok/s), while the
++    // cost 13% of Flash-Next decode throughput (36.4 -> 31.7 tok/s), while the
+     // gemm's own per-thread scratch stays hot in cache at those sizes.
+     int perm_m = 0;
++    // Q8 mode stores the activation in perm as int8 rows followed by fp32 half-block scales.
++    bool perm_is_q8 = false;
+     static constexpr int kPermMinRows = 16;
+     size_t max_m = 0, k = 0;
+ 
+@@ -138,7 +172,28 @@
+       }
+       std::memcpy(data + (size_t)m_start * k, src + (size_t)m_start * k,
+                   (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
++      perm_is_q8 = false;
+       if (perm == nullptr || m < kPermMinRows) {
++        // Q8 activation layout for the 1-3 row path: int8 values per 32-element block plus fp32 scales, with rows at
++        // perm + mi * k bytes, scales behind all max_m rows. Fits: perm has max_m * k * 4 bytes.
++        if (perm != nullptr && m <= 3 && (k % 32) == 0 && avx2kern::kern_mode() == 2) {
++          int8_t* q = (int8_t*)perm;
++          float* da = (float*)(q + max_m * k);
++          for (int mi = m_start; mi < m_end; mi++)
++            avx2kern::quant_act_q8(src + (size_t)mi * k, (int)k, q + (size_t)mi * k, da + (size_t)mi * (k / 32));
++          perm_m = m;
++          perm_is_q8 = true;
++          return;
++        }
++        // For single-row decode, fill the permuted FP32 copy once per expert
++        // (vectorized, with the same values as per-call conversion in gemm_mxfp4), so the GEMV path
++        // does not repeat permutation during per-task calls.
++        if (perm != nullptr && m <= 3 && (k % 32) == 0 && avx2kern::kern_mode() >= 1) {
++          for (int mi = m_start; mi < m_end; mi++)
++            avx2kern::permute_act_bf16(src + (size_t)mi * k, perm + (size_t)mi * k, (int)k);
++          perm_m = m;
++          return;
++        }
+         perm_m = 0;
+         return;
+       }
+@@ -159,6 +214,9 @@
+   struct BufferB {
+     uint8_t* b = nullptr;  // nibble-packed FP4 (may be nullptr in scale-only mode)
+     float* d = nullptr;    // FP32 group scales
++    // When KT_DS41_MU_MXFP4_E8M0=1 and KT_DS41_MU_MXFP4_KERNEL>=1, this compact E8M0 copy of d is read only by the
++    // small-batch path; nullptr means use d. d remains valid for other paths and GPU export.
++    uint8_t* e8 = nullptr;
+     int n = 0, k = 0, k_group_size = 0, k_group_count = 0;
+ 
+     BufferB() = default;
+@@ -236,6 +294,43 @@
+   const int group_size = b.k_group_size;
+   const size_t row_bytes = (size_t)k / 2;
+ 
++  // Small-batch decode kernel (KT_DS41_MU_MXFP4_KERNEL>=1): 1-3 activation rows, group 32, activation pre-permuted by
++  // BufferA::from_mat. Per (row, activation) the arithmetic equals the single-row loop of the fast
++  // path below, so the output is bit-identical; E8M0 only changes where the (same) scale is read.
++  if (a.perm_is_q8) {
++    // Q8 activation is not bit-identical and must pass its quality gates. Only reachable for group size 32.
++    if (!(group_size == 32 && (k % 32) == 0 && m >= 1 && m <= 3 && a.perm != nullptr && a.perm_m >= m))
++      throw std::runtime_error("KT_DS41_MU_MXFP4_KERNEL=2: q8 activation but unsupported shape (needs group 32, m <= 3)");
++    const bool e8 = b.e8 != nullptr;
++    const void* dv = e8 ? (const void*)b.e8 : (const void*)b.d;
++    const int8_t* q = (const int8_t*)a.perm;
++    const float* da = (const float*)(q + a.max_m * a.k);
++    switch (m * 2 + (e8 ? 1 : 0)) {
++      case 2: avx2kern::gemv_q8<1, false>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 3: avx2kern::gemv_q8<1, true>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 4: avx2kern::gemv_q8<2, false>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 5: avx2kern::gemv_q8<2, true>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 6: avx2kern::gemv_q8<3, false>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      default: avx2kern::gemv_q8<3, true>(q, da, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++    }
++    return;
++  }
++  if (avx2kern::kern_mode() == 1 && group_size == 32 && (k % 32) == 0 && m >= 1 && m <= 3 && a.perm != nullptr &&
++      a.perm_m >= m) {
++    const bool e8 = b.e8 != nullptr;
++    const void* dv = e8 ? (const void*)b.e8 : (const void*)b.d;
++    const size_t as = (size_t)k;
++    switch (m * 2 + (e8 ? 1 : 0)) {
++      case 2: avx2kern::gemv_m<1, false>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 3: avx2kern::gemv_m<1, true>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 4: avx2kern::gemv_m<2, false>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 5: avx2kern::gemv_m<2, true>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 6: avx2kern::gemv_m<3, false>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      default: avx2kern::gemv_m<3, true>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++    }
++    return;
++  }
++
+   const __m128i lut_lo = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_lo);
+   const __m128i lut_hi = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_hi);
+ 
+@@ -669,6 +764,15 @@
+       throw std::runtime_error("MXFP4 AVX2 MoE requires KGroup FP4 without zero point");
+     printf("Created AVX2_MXFP4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()),
+            config_.quant_config.group_size);
++    static bool kern_logged = false;
++    if (!kern_logged) {
++      kern_logged = true;
++      printf("[KERN] KT_DS41_MU_MXFP4_KERNEL=%d KT_DS41_MU_MXFP4_E8M0=%d (0/0 = legacy path; 2 = Q8, not bit-identical)\n",
++             avx2kern::kern_mode(), (int)avx2kern::e8m0_mode());
++      if (avx2kern::e8m0_mode() && avx2kern::kern_mode() < 1)
++        printf("[KERN] KT_DS41_MU_MXFP4_E8M0=1 without KT_DS41_MU_MXFP4_KERNEL>=1 is ineffective (no e8m0 copy)\n");
++      fflush(stdout);
++    }
+   }
+ 
+   size_t buffer_a_required_size_impl(size_t m, size_t k) const {
+@@ -837,6 +941,16 @@
+     size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
+     size_t gpu_tp_scale_elem_count =
+         (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
++    // Half offsets inside w13 (flags 0: gate at offset 0, up at the second half) and
++    // the scale element type (bf16, or e8m0 bytes with bit 1; offsets count elements either way).
++    const int wflags = ktstream::write_flags();
++    const bool e8out = (wflags & 2) != 0;
++    const size_t gate_w_half = (wflags & 1) ? gpu_tp_weight_bytes : 0, up_w_half = (wflags & 1) ? 0 : gpu_tp_weight_bytes;
++    const size_t gate_s_half = (wflags & 1) ? gpu_tp_scale_elem_count : 0,
++                 up_s_half = (wflags & 1) ? 0 : gpu_tp_scale_elem_count;
++    const typename T::BufferB* const gbb = gate_bb_[expert_id].get();
++    const typename T::BufferB* const ubb = up_bb_[expert_id].get();
++    const typename T::BufferB* const dbb = down_bb_[expert_id].get();
+ 
+     if (cpu_tp_count >= gpu_tp_count) {
+       int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+@@ -845,6 +959,8 @@
+       ggml_bf16_t* w13_sdst = (ggml_bf16_t*)w13_scale_ptrs[target_gpu_tp];
+       uint8_t* w2_wdst = (uint8_t*)w2_weight_ptrs[target_gpu_tp];
+       ggml_bf16_t* w2_sdst = (ggml_bf16_t*)w2_scale_ptrs[target_gpu_tp];
++      uint8_t* w13_sdst8 = (uint8_t*)w13_scale_ptrs[target_gpu_tp];
++      uint8_t* w2_sdst8 = (uint8_t*)w2_scale_ptrs[target_gpu_tp];
+       size_t w_off = (size_t)local_idx * cpu_tp_weight_bytes;
+       size_t s_off = (size_t)local_idx * cpu_tp_scale_elem_count;
+ 
+@@ -856,10 +972,10 @@
+           [=, this](int tid) {
+             if (tid < NWT) {
+               size_t s = (size_t)tid * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + s, gate_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + gate_w_half + s, gate_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2) {
+               size_t s = (size_t)(tid - NWT) * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + up_w_half + s, up_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tid - NWT * 2) * cols_per;
+@@ -871,12 +987,21 @@
+               size_t gwo = (size_t)local_idx * wpc, gso = (size_t)local_idx * spc;
+               for (size_t col = cs; col < ce; col++) {
+                 std::memcpy(w2_wdst + col * gws + gwo, down_bb_[expert_id]->b + col * wpc, wpc);
+-                fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
++                if (e8out)
++                  ktstream::put_e8m0(w2_sdst8 + col * gss + gso, dbb->e8, dbb->d, col * spc, spc);
++                else
++                  fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+               }
+             } else if (tid == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              if (e8out)
++                ktstream::put_e8m0(w13_sdst8 + s_off + gate_s_half, gbb->e8, gbb->d, 0, cpu_tp_scale_elem_count);
++              else
++                fp32_to_bf16(w13_sdst + s_off + gate_s_half, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             } else {
+-              fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              if (e8out)
++                ktstream::put_e8m0(w13_sdst8 + s_off + up_s_half, ubb->e8, ubb->d, 0, cpu_tp_scale_elem_count);
++              else
++                fp32_to_bf16(w13_sdst + s_off + up_s_half, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             }
+           },
+           nullptr);
+@@ -900,13 +1025,15 @@
+             ggml_bf16_t* w13_sdst = (ggml_bf16_t*)w13_scale_ptrs[gtp];
+             uint8_t* w2_wdst = (uint8_t*)w2_weight_ptrs[gtp];
+             ggml_bf16_t* w2_sdst = (ggml_bf16_t*)w2_scale_ptrs[gtp];
++            uint8_t* w13_sdst8 = (uint8_t*)w13_scale_ptrs[gtp];
++            uint8_t* w2_sdst8 = (uint8_t*)w2_scale_ptrs[gtp];
+             size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
+             if (tt < NWT) {
+               size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + s, gate_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + gate_w_half + s, gate_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2) {
+               size_t s = (size_t)(tt - NWT) * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + up_w_half + s, up_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tt - NWT * 2) * cols_per;
+@@ -917,12 +1044,21 @@
+                 size_t cwoff = col * config_.intermediate_size / 2 + lg * dw / config_.hidden_size;
+                 size_t csoff = col * (config_.intermediate_size / group_size) + lg * ds / config_.hidden_size;
+                 std::memcpy(w2_wdst + col * wgc, down_bb_[expert_id]->b + cwoff, wgc);
+-                fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
++                if (e8out)
++                  ktstream::put_e8m0(w2_sdst8 + col * sgc, dbb->e8, dbb->d, csoff, sgc);
++                else
++                  fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+               }
+             } else if (tt == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
++              if (e8out)
++                ktstream::put_e8m0(w13_sdst8 + gate_s_half, gbb->e8, gbb->d, cos, ds);
++              else
++                fp32_to_bf16(w13_sdst + gate_s_half, gate_bb_[expert_id]->d + cos, ds);
+             } else {
+-              fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
++              if (e8out)
++                ktstream::put_e8m0(w13_sdst8 + up_s_half, ubb->e8, ubb->d, cos, ds);
++              else
++                fp32_to_bf16(w13_sdst + up_s_half, up_bb_[expert_id]->d + cos, ds);
+             }
+           },
+           nullptr);
+@@ -936,6 +1072,62 @@
+   std::vector<void*> tp_owned_down_bufs_;
+   std::vector<void*> tp_owned_gate_bufs_;
+   std::vector<void*> tp_owned_up_bufs_;
++  std::vector<void*> tp_owned_e8_bufs_;  // E8M0 scale buffers
++
++  // Compact E8M0 copy of the FP32 group scales for every CPU expert, allocated and
++  // filled on the part's NUMA node. A matrix whose scales are not all exact powers of two (2^-127 ..
++  // 2^127) keeps e8 == nullptr and stays on FP32 (fallback). Only the KERN m<=3 path reads it.
++  void build_e8m0() {
++    for (void*& p : tp_owned_e8_bufs_)
++      if (p) { std::free(p); p = nullptr; }
++    if (!(avx2kern::kern_mode() >= 1 && avx2kern::e8m0_mode())) return;
++    auto& tps = this->tps;
++    auto pool = this->config.pool;
++    tp_owned_e8_bufs_.assign(this->tp_count, nullptr);
++    std::vector<long> ok(this->tp_count, 0), fb(this->tp_count, 0);
++    std::vector<size_t> bytes(this->tp_count, 0);
++    pool->dispense_backend()->do_numa_job([&, this](int i) {
++      auto* tp = tps[i].get();
++      auto& tpc = tp->config_;
++      const size_t g_gu = (size_t)tpc.intermediate_size * (tpc.hidden_size / 32);
++      const size_t g_d = (size_t)tpc.hidden_size * (tpc.intermediate_size / 32);
++      const size_t per_exp = 2 * g_gu + g_d;
++      uint8_t* buf = (uint8_t*)std::aligned_alloc(64, ((size_t)tpc.expert_num * per_exp + 63) & ~(size_t)63);
++      if (!buf) throw std::runtime_error("aligned_alloc failed for E8M0 scales");
++      tp_owned_e8_bufs_[i] = buf;
++      std::atomic<long> n_ok{0}, n_fb{0}, n_exp{0};
++      pool->get_subpool(i)->do_work_stealing_job(
++          tpc.expert_num, nullptr,
++          [&, buf, per_exp, g_gu](int eid) {
++            if (tpc.should_skip_expert(eid)) return;
++            n_exp++;
++            uint8_t* base = buf + (size_t)eid * per_exp;
++            auto one = [&](typename K::BufferB& bb, uint8_t* dst) {
++              bb.e8 = nullptr;
++              if (bb.k_group_size != 32 || bb.d == nullptr) { n_fb++; return; }
++              const size_t cnt = (size_t)bb.n * bb.k_group_count;
++              for (size_t q = 0; q < cnt; q++) {
++                const int e = avx2kern::f32_to_e8m0_exact(bb.d[q]);
++                if (e < 0) { n_fb++; return; }
++                dst[q] = (uint8_t)e;
++              }
++              bb.e8 = dst;
++              n_ok++;
++            };
++            one(*tp->gate_bb_[eid], base);
++            one(*tp->up_bb_[eid], base + g_gu);
++            one(*tp->down_bb_[eid], base + 2 * g_gu);
++          },
++          nullptr);
++      ok[i] = n_ok.load();
++      fb[i] = n_fb.load();
++      bytes[i] = (size_t)n_exp.load() * per_exp;
++    });
++    for (int i = 0; i < this->tp_count; i++)
++      printf("[KERN] E8M0 part %d: %ld Matrizen e8m0, %ld Rueckfall fp32, %.1f MB e8m0-Skalen\n", i, ok[i], fb[i],
++             bytes[i] / 1e6);
++    fflush(stdout);
++  }
+ 
+  public:
+   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>>;
+@@ -948,6 +1140,8 @@
+       if (p) std::free(p);
+     for (void* p : tp_owned_up_bufs_)
+       if (p) std::free(p);
++    for (void* p : tp_owned_e8_bufs_)
++      if (p) std::free(p);
+   }
+ 
+   void load_weights() override {
+@@ -1136,6 +1330,7 @@
+       });
+     }
+ 
++    build_e8m0();  // No-op unless KT_DS41_MU_MXFP4_KERNEL>=1 and KT_DS41_MU_MXFP4_E8M0=1
+     this->weights_loaded = true;
+   }
+ 
+diff -ruN a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+--- a/kt-kernel/python/experts_base.py	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/python/experts_base.py	2026-10-03 13:31:08.228506727 +0200
+@@ -17,6 +17,49 @@
+ 
+ from kt_kernel import kt_kernel_ext
+ 
++# KT_DS41_MU_CB_JOIN=1 replaces the two cudaLaunchHostFunc nodes per MoE layer
++# with stream memory operations (submit/sync_with_cuda_stream) on mapped pinned flags and one spinning poller
++# thread (cpu_backend/doorbell_join.h).
++# Same MoE arithmetic; deferral must be 0. Unset/0 = stock path.
++_CB_JOIN = os.environ.get("KT_DS41_MU_CB_JOIN", "0") == "1"
++
++# KT_DS41_MU_DEFER_MHC=1 enables deferral of low-weight experts from layer L
++# (submit_forward(defer=d)); sync_deferred() fetches their output (def_output)
++# during the attention step at layer L+1 (SGLang deepseek_v4.py). With CB-JOIN, the poller splits top-k (defer_split.h)
++# and runs deferred work after immediate work (ddone flag). Without CB-JOIN, two TaskQueue tasks are used (allow_pending).
++# KT_DS41_MU_DEFER_MODE=all|cpu selects the ranking set; all uses select_deferred_experts. KT_DS41_MU_DEFER_STATS=1 enables [CB-JOIN-DEFER] lines.
++# Disabled by default; the existing CB-JOIN and stock paths are unchanged. Cannot be combined with --kt-max-deferred-experts-per-token > 0.
++_DEFER_MHC = os.environ.get("KT_DS41_MU_DEFER_MHC", "0") == "1"
++_DEFER_MODE = 1 if os.environ.get("KT_DS41_MU_DEFER_MODE", "all") == "cpu" else 0
++_DEFER_STATS = os.environ.get("KT_DS41_MU_DEFER_STATS", "0") == "1"
++
++
++class _CBJoin:
++    inst = None
++    layers = set()
++    buf_ids = {}  # pointer tuple -> table id; pinned blocks get reused, so this stays small
++
++    @classmethod
++    def buffer_id(cls, *ptrs):
++        bid = cls.buf_ids.get(ptrs)
++        if bid is None:
++            bid = cls.get().register_buffer(*ptrs)
++            cls.buf_ids[ptrs] = bid
++        return bid
++
++    @classmethod
++    def get(cls):
++        if cls.inst is None:
++            cpu = int(os.environ.get("KT_DS41_MU_CB_JOIN_CPU", "-1"))
++            if _DEFER_MHC:
++                cls.inst = kt_kernel_ext.DoorbellJoin(128, 65536, cpu, _DEFER_MODE, int(_DEFER_STATS))
++                print(f"[CB-JOIN] enabled (memop join, poll_cpu={cpu}, deferral mode={_DEFER_MODE} stats={int(_DEFER_STATS)})",
++                      flush=True)
++            else:
++                cls.inst = kt_kernel_ext.DoorbellJoin(128, 65536, cpu)  # ~3 MB table, append-only
++                print(f"[CB-JOIN] enabled (memop join, poll_cpu={cpu})", flush=True)
++        return cls.inst
++
+ 
+ def generate_gpu_experts_masks(
+     activation_freq: torch.Tensor,
+@@ -83,19 +126,28 @@
+     capture_buffers: Dict = dict()
+     temp_bs: int = 0
+     temp_buffer: tuple = tuple()
++    temp_by_half: Dict = dict()  # Temporary buffer slot for the second micro-batch
+     buffer_depth: int = 2
+ 
+     @classmethod
+-    def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
++    def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok, half: int = 0):
++        """half: 0 = the usual buffers (key bs, unchanged);
++        1 = a second set for micro-batch B of a two-half decode step (key (bs, 1)),
++        so A_L and B_L of the same layer never share pinned memory."""
+         hidden_size = hidden_states.shape[-1]
+         batch_size = hidden_states.shape[0]
++        key = batch_size if not half else (batch_size, int(half))
+ 
+         pin_memory = True
+ 
+-        if batch_size in cls.capture_buffers:
+-            return cls.capture_buffers[batch_size]
+-        if batch_size == cls.temp_bs:
++        if key in cls.capture_buffers:
++            return cls.capture_buffers[key]
++        if not half and key == cls.temp_bs:
+             return cls.temp_buffer
++        if half and key in cls.temp_by_half:
++            # own temporary slot for each half: during eager two-half decoding, A_L and B_L are
++            # flight together, so B must never replace A's pinned buffers
++            return cls.temp_by_half[key]
+ 
+         input_tensor_cpu = [
+             torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+@@ -135,10 +187,42 @@
+             bsz_tensor_cpu,
+             output_gpu,
+         )
++        if _DEFER_MHC:
++            # Second output per slot for deferred experts (pinned CPU buffer plus GPU copy)
++            def_output_cpu = [
++                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
++                for _ in range(cls.buffer_depth)
++            ]
++            def_output_gpu = [
++                torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
++                for _ in range(cls.buffer_depth)
++            ]
++        if _CB_JOIN:
++            join_ids = [
++                _CBJoin.buffer_id(
++                    bsz_tensor_cpu[s].data_ptr(),
++                    num_experts_per_tok,
++                    immediate_experts_ids_cpu[s].data_ptr(),
++                    weights_cpu[s].data_ptr(),
++                    input_tensor_cpu[s].data_ptr(),
++                    output_cpu[s].data_ptr(),
++                    *((def_output_cpu[s].data_ptr(), hidden_size * def_output_cpu[s].element_size()) if _DEFER_MHC else ()),
++                )
++                for s in range(cls.buffer_depth)
++            ]
++            cur_buffer = cur_buffer + (join_ids,)
++        elif _DEFER_MHC:
++            cur_buffer = cur_buffer + (None,)
++        if _DEFER_MHC:
++            # layout with deferral: 7 base entries, join_ids (or None), (def_output_cpu, def_output_gpu)
++            cur_buffer = cur_buffer + ((def_output_cpu, def_output_gpu),)
+         if batch_size in cls.capture_bs:
+-            cls.capture_buffers[batch_size] = cur_buffer
+-        cls.temp_bs = batch_size
+-        cls.temp_buffer = cur_buffer
++            cls.capture_buffers[key] = cur_buffer
++        elif half:
++            cls.temp_by_half = {key: cur_buffer}
++        else:
++            cls.temp_bs = key
++            cls.temp_buffer = cur_buffer
+         return cur_buffer
+ 
+ 
+@@ -231,6 +315,8 @@
+     """
+ 
+     _layer_has_pending_deferred: Dict[int, bool] = {}
++    # Layer -> True while its deferred part is submitted and has not yet been fetched by sync_deferred().
++    _mhc_pending: Dict[int, bool] = {}
+ 
+     def __init__(
+         self,
+@@ -302,11 +388,13 @@
+         )
+ 
+         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
++        if _DEFER_MHC and self.max_deferred_experts_per_token > 0:
++            raise ValueError("KT_DS41_MU_DEFER_MHC=1 needs --kt-max-deferred-experts-per-token 0 (old deferral path)")
+         self.method = method
+         # V4-Flash 2604B SwiGLU clamp limit; 0.0 = disabled. NativeMoEWrapper
+         # (MXFP4 path) reads this in load_weights() and writes it into
+         # MOEConfig.swiglu_limit. Other backends ignore it (C++ act_fn skips
+-        # the clamp branch when limit==0). Origin: kt-sglang 耦合.
++        # the clamp branch when limit==0). Origin: kt-sglang integration.
+         self.swiglu_limit = float(swiglu_limit)
+ 
+         # Initialize CPU inference engine (singleton via shared base class)
+@@ -380,9 +468,15 @@
+         topk_ids: torch.Tensor,
+         topk_weights: torch.Tensor,
+         cuda_stream,
++        defer: int = 0,
++        half: int = 0,
+     ):
+         """
+         Submit forward inference task to CPU (non-blocking).
++        half: micro-batch index; half 1 uses its own buffers and the
++        CB-JOIN job j = layer_idx + 64 (half 1), 0 = unchanged.
++        defer (KT_DS41_MU_DEFER_MHC): number of lowest-weight experts whose work goes to def_output and is fetched
++        later by sync_deferred(); 0 = unchanged path.
+ 
+         Args:
+             hidden_states: Input hidden states [batch_size, hidden_size]
+@@ -401,7 +495,18 @@
+             output_cpu,
+             bsz_tensor_cpu,
+             _output_gpu,
+-        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
++            *join_ids,
++        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok, half)
++        half = int(half or 0)
++        if half and not _CB_JOIN:
++            raise ValueError("submit_forward(half>0) needs KT_DS41_MU_CB_JOIN=1")
++        job = self.layer_idx + 64 * half
++        defer = int(defer or 0)
++        if defer:
++            if not _DEFER_MHC:
++                raise ValueError("submit_forward(defer>0) needs KT_DS41_MU_DEFER_MHC=1")
++            if not 0 < defer < self.num_experts_per_tok:
++                raise ValueError(f"defer must be 1..{self.num_experts_per_tok - 1}, got {defer}")
+ 
+         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+         next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
+@@ -411,10 +516,17 @@
+         topk_ids_long = topk_ids.to(torch.long)
+         immediate_ids: torch.Tensor
+         deferred_ids: Optional[torch.Tensor]
++        mhc_def_ids: Optional[torch.Tensor] = None
+         if self.max_deferred_experts_per_token > 0:
+             protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+ 
+             immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
++        elif defer and not _CB_JOIN:
++            # GPU-split path: apply the previous rule on the GPU
++            immediate_ids, mhc_def_ids = self.select_deferred_experts(
++                topk_ids_long, topk_weights, self.num_experts_per_tok - defer
++            )
++            deferred_ids = None
+         else:
+             immediate_ids = topk_ids_long
+             deferred_ids = None
+@@ -423,6 +535,57 @@
+         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+ 
++        if _CB_JOIN:
++            assert deferred_ids is None, "KT_DS41_MU_CB_JOIN=1 requires --kt-max-deferred-experts-per-token 0"
++            join = _CBJoin.get()
++            if job not in _CBJoin.layers:
++                if _DEFER_MHC:
++                    join.register_layer(job, self.moe, self.gpu_experts_mask.data_ptr(), self.num_experts)
++                else:
++                    join.register_layer(job, self.moe)
++                _CBJoin.layers.add(job)
++            if defer:
++                assert not BaseMoEWrapper._mhc_pending.get(job), "deferred part of this layer still open"
++                join.submit_defer(cuda_stream, job, join_ids[0][current_slot], defer)
++                BaseMoEWrapper._mhc_pending[job] = True
++            else:
++                join.submit(cuda_stream, job, join_ids[0][current_slot])
++            return
++
++        if mhc_def_ids is not None:
++            # GPU-split path: immediate task writes to output_cpu and deferred task to def_output_cpu (both non-incremental);
++            # sync_forward waits with allow_pending=1, sync_deferred with 0.
++            assert not BaseMoEWrapper._mhc_pending.get(self.layer_idx), "deferred part of this layer still open"
++            def_output_cpu, _def_output_gpu = join_ids[1]
++            self.cpu_infer.submit_with_cuda_stream(
++                cuda_stream,
++                self.moe.forward_task(
++                    bsz_slot_tensor.data_ptr(),
++                    immediate_experts_ids_cpu[current_slot].size(-1),
++                    immediate_experts_ids_cpu[current_slot].data_ptr(),
++                    weights_cpu[current_slot].data_ptr(),
++                    input_tensor_cpu[current_slot].data_ptr(),
++                    output_cpu[current_slot].data_ptr(),
++                    False,
++                ),
++            )
++            deferred_experts_ids_cpu[current_slot].copy_(mhc_def_ids, non_blocking=True)
++            self.cpu_infer.submit_with_cuda_stream(
++                cuda_stream,
++                self.moe.forward_task(
++                    bsz_slot_tensor.data_ptr(),
++                    deferred_experts_ids_cpu[current_slot].size(-1),
++                    deferred_experts_ids_cpu[current_slot].data_ptr(),
++                    weights_cpu[current_slot].data_ptr(),
++                    input_tensor_cpu[current_slot].data_ptr(),
++                    def_output_cpu[current_slot].data_ptr(),
++                    False,
++                ),
++            )
++            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
++            BaseMoEWrapper._mhc_pending[self.layer_idx] = True
++            return
++
+         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+         self.cpu_infer.submit_with_cuda_stream(
+             cuda_stream,
+@@ -454,7 +617,7 @@
+             )
+             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+ 
+-    def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
++    def sync_forward(self, hidden_states: torch.Tensor, cuda_stream, half: int = 0) -> torch.Tensor:
+         """
+         Synchronize and retrieve forward inference results.
+ 
+@@ -474,14 +637,39 @@
+             output_cpu,
+             _bsz_tensor_cpu,
+             output_gpu,
+-        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
++            *_join_ids,
++        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok, half)
+ 
+         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
++        if _CB_JOIN:
++            _CBJoin.get().wait(cuda_stream, self.layer_idx + 64 * int(half or 0))
++            output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
++            return output_gpu[current_slot]
+         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
++        if BaseMoEWrapper._mhc_pending.get(self.layer_idx, False):
++            allow_pending = 1  # Only the immediate task may remain pending
+         self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+         return output_gpu[current_slot]
+ 
++    def sync_deferred(self, hidden_states: torch.Tensor, cuda_stream, half: int = 0) -> torch.Tensor:
++        """Wait for this layer's deferred part (submitted with defer>0) and return it on the GPU
++        (bf16 [tokens, hidden], weighted sum of deferred CPU experts, without routed_scaling_factor). Called during
++        the next layer's attention step; hidden_states selects the buffer (same token count as the MoE call)."""
++        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
++        buf = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok, half)
++        def_output_cpu, def_output_gpu = buf[8]
++        job = self.layer_idx + 64 * int(half or 0)
++        if not BaseMoEWrapper._mhc_pending.pop(job, False):
++            raise RuntimeError(f"sync_deferred for layer {self.layer_idx} (job {job}) without a deferred submit")
++        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
++        if _CB_JOIN:
++            _CBJoin.get().wait_deferred(cuda_stream, job)
++        else:
++            self.cpu_infer.sync_with_cuda_stream(cuda_stream, 0)
++        def_output_gpu[current_slot].copy_(def_output_cpu[current_slot], non_blocking=True)
++        return def_output_gpu[current_slot]
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -541,4 +729,5 @@
+         KExpertsCPUBuffer.capture_buffers.clear()
+         KExpertsCPUBuffer.temp_bs = 0
+         KExpertsCPUBuffer.temp_buffer = tuple()
++        KExpertsCPUBuffer.temp_by_half = dict()
+ 
+diff -ruN a/kt-kernel/python/sft/base.py b/kt-kernel/python/sft/base.py
+--- a/kt-kernel/python/sft/base.py	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/python/sft/base.py	2026-10-03 13:31:08.229293433 +0200
+@@ -838,6 +838,7 @@
+             output_cpu,
+             bsz_tensor_cpu,
+             output_gpu,
++            *_join_ids,  # 8th buffer element when KT_DS41_MU_CB_JOIN=1
+         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+ 
+         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+diff -ruN a/kt-kernel/python/utils/amx.py b/kt-kernel/python/utils/amx.py
+--- a/kt-kernel/python/utils/amx.py	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/python/utils/amx.py	2026-10-03 13:31:08.229183890 +0200
+@@ -8,6 +8,20 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _kt_check_gpu_mask(moe_config, mask) -> None:
++    """Detect a pybind overload trap. MOEConfig has two 5-number constructors
++    (ext_bindings.cpp: ..., int num_gpu_experts) and (..., uintptr_t gpu_experts_mask_ptr); the int one is tried first.
++    A mask address below 2^31 therefore selects it, the mask is silently ignored and the CPU also computes every GPU
++    expert (double counting). Pinned masks live high, so the server is fine today; fail loudly if that ever changes."""
++    want = int(mask.sum().item())
++    got = int(moe_config.num_gpu_experts)
++    if got != want:
++        raise RuntimeError(
++            f"KT MOEConfig ignored the GPU expert mask: num_gpu_experts={got} != mask.sum()={want} "
++            f"(mask at 0x{mask.data_ptr():x}; pybind overload trap, see utils/amx.py _kt_check_gpu_mask)"
++        )
++
+ # Use relative imports for package structure
+ from ..experts_base import BaseMoEWrapper
+ from .loader import (
+@@ -372,6 +386,7 @@
+             self.moe_intermediate_size,
+             self.gpu_experts_mask.data_ptr(),
+         )
++        _kt_check_gpu_mask(moe_config, self.gpu_experts_mask)
+         moe_config.layer_idx = self.layer_idx
+         moe_config.pool = self.cpu_infer.backend_
+         moe_config.max_len = self.chunked_prefill_size
+@@ -487,6 +502,7 @@
+             self.moe_intermediate_size,
+             self.gpu_experts_mask.data_ptr(),
+         )
++        _kt_check_gpu_mask(moe_config, self.gpu_experts_mask)
+         moe_config.layer_idx = self.layer_idx
+         moe_config.pool = self.cpu_infer.backend_
+         moe_config.max_len = self.chunked_prefill_size
+@@ -573,7 +589,7 @@
+         self._swiglu_alpha = float(swiglu_alpha)
+         # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
+         # if the experts.py guard is bypassed (e.g., by a future caller
+-        # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
++        # that constructs NativeMoEWrapper directly). Origin: kt-sglang integration.
+         if swiglu_limit != 0.0 and method not in ("MXFP4", "MXFP8"):
+             raise ValueError(
+                 f"NativeMoEWrapper received swiglu_limit={swiglu_limit} with "
+@@ -811,6 +827,7 @@
+             self.moe_intermediate_size,
+             self.gpu_experts_mask.data_ptr(),
+         )
++        _kt_check_gpu_mask(moe_config, self.gpu_experts_mask)
+         moe_config.layer_idx = self.layer_idx
+         moe_config.pool = self.cpu_infer.backend_
+         moe_config.max_len = self.chunked_prefill_size
+@@ -820,7 +837,7 @@
+         # (defence in depth) so a future caller that bypasses both the
+         # experts.py and the __init__ guards still cannot apply the clamp
+         # on RAWINT4 / FP8 / BF16 / FP8_PERCHANNEL / GPTQ_INT4 paths.
+-        # Origin: kt-sglang 耦合.
++        # Origin: kt-sglang integration.
+         if self.swiglu_limit != 0.0 and self.method not in ("MXFP4", "MXFP8"):
+             raise ValueError(
+                 f"NativeMoEWrapper.load_weights: swiglu_limit="

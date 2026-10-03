@@ -1,0 +1,30 @@
+Long-context inference with CPU expert offload — source release v2 candidate
+
+Own portable tooling and patch modifications are licensed under Apache-2.0. Upstream copyright notices remain in source and patches. This notice does not replace upstream licenses and does not grant rights to model weights.
+
+SGLang: https://github.com/sgl-project/sglang
+Pin 1aa0e962b206102b7c439a4a0c4981cfec6e87bc. Apache-2.0.
+
+KTransformers: https://github.com/kvcache-ai/ktransformers
+Pin e80614fc2d2c3990bd1abe895d5014fc14733fde. Apache-2.0.
+
+FlashInfer: https://github.com/flashinfer-ai/flashinfer
+Referenced runtime dependency. Upstream Apache-2.0 and bundled third-party notices apply. No modified FlashInfer source or binary is redistributed here. The recorded archives are provenance entries; a short version string alone does not select a runtime.
+
+Compatibility recipe: https://github.com/05yuki/dsv41-flash-dual-epyc
+Pin 3bf450e11ffe837b4bb6c9550a7ca682dac0fbaf. Copyright 2026 05yuki. Apache-2.0; the recipe’s exception for the MIT Engram adapter is preserved.
+
+Engram adapter origin:
+https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
+Copyright (c) 2026 0xSero. MIT License.
+The derived adapter files retain their source headers and terms. The MIT text is retained in `licenses/MIT-0xSero.txt`. The repository credit identifies source origin; it is not a manifest-generation instruction.
+
+llama.cpp: https://github.com/ggml-org/llama.cpp
+Pin a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f. MIT.
+
+pybind11: https://github.com/pybind/pybind11
+Pin bb05e0810b87e74709d9f4c4545f1f57a1b386f5. BSD license in `licenses/`.
+
+DeepSeek-V4.1-Flash weights and Engram data are not included. Consult the applicable upstream model distribution and license for the exact supplied weights. Tooling licenses do not change those terms.
+
+Warmup text is original. No third-party text corpus, request bodies, run logs, model weights, Engram shards or private source reconstruction are distributed.
