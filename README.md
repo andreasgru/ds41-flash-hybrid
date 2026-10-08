@@ -1,6 +1,6 @@
 # ds41-flash-hybrid
 
-Source release candidate v2.1 for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. The project name is `ds41-flash-hybrid`. Initial repository distribution is private; public release is pending separate approval. This package contains a compatibility patch series, an English multi-user layer, portable build and launch tools, and real-input regression tests. Weights, Engram data, runtime environments and native binaries are supplied separately.
+Source release candidate v2.1.1 for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. The project name is `ds41-flash-hybrid`. This package contains a compatibility patch series, an English multi-user layer, portable build and launch tools, and real-input regression tests. Weights, Engram data, runtime environments and native binaries are supplied separately.
 
 The intended workload is 1–2 main sessions approaching 500k tokens plus 4–6 subordinate sessions. The historical run used one main and four subordinate sessions; it does not establish that the full workload meets its targets.
 
@@ -97,3 +97,8 @@ The five performance gates remain red. Offline source/configuration checks do no
 Own tooling and patches use Apache-2.0; upstream notices are preserved. Thanks to SGLang, KTransformers, FlashInfer and the 05yuki compatibility recipe. The Engram adapter retains 0xSero's MIT copyright/header/text. llama.cpp is MIT, pybind11 BSD. Full texts and pinned provenance are in `licenses/` and [NOTICE](NOTICE).
 
 Weights are not redistributed; the tooling license grants no model/data rights. Original synthetic warmup text is included; no Wikipedia or Gutenberg corpus is copied.
+
+## Versions
+
+- v2.1.1 (8 October 2026): public release. README wording and checksum files only; code, patches, configuration and tests are byte-identical to v2.1.
+- v2.1 (3 October 2026): source release candidate, first distributed privately (package ds41-flash-hybrid-v2.1-60abc3c5f971, tag `v2.1`).
