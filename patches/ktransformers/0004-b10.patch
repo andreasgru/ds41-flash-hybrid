@@ -1,0 +1,375 @@
+Origin: Pinned Arena and B10 native source integration
+Purpose: E4M3 CPU activation decode with explicit numerical-domain checks
+License: Apache-2.0; preserve upstream notices
+
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-b10.hpp b/kt-kernel/operators/avx2/mxfp4-b10.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-b10.hpp	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/operators/avx2/mxfp4-b10.hpp	2026-10-18 13:14:42.574294923 +0200
+@@ -0,0 +1,224 @@
++/**
++ * @Description  : B10 = KT_DS41_MU_MXFP4_KERNEL=3: CPU expert kernel with E4M3 activation (W4A8, GPU recipe), MXFP4 weights unchanged.
++ *                 CPU E4M3 activation path with explicit numerical-domain checks.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Numerics (identical in intent to the GPU path flashinfer cvt_warp_fp16_to_mxfp8, quantization_utils.cuh, lines 885-915):
++ *   per row and 32 columns: amax = max|x| (bf16), SF = fl32(amax * fl32(1/448)), scale exponent e = ceil(log2(SF)) (E8M0, round up),
++ *   y = x * 2^-e, clamped to +-448, rounded to the E4M3 grid (RNE, saturating); no amax floor.
++ *   The E4M3 value is then stored as int16 fixed point q = RNE(value * 64) (unit 2^-6, |q| <= 28672): exact for every grid value
++ *   with |value| >= 2^-3 (i.e. all but values below 1/1792 of the block maximum, abs error <= 2^-7).
++ *   Weights: FP4 E2M1 * 2 as int8 (LUT, +-12), scale 2^(c-127) (E8M0) or fp32.
++ *   Block sum S = sum(q_i * w2_i) in int32 is exact (|S| <= 32*28672*12 < 2^24), term = S * 2^e * ws * 2^-7 (powers of two, exact),
++ *   acc = fma(float(S), sc, acc) like the reference's C += C_blk*sa*sb. Different accumulation order than the reference (4 lane-chains).
++ * Activation layout per 32-group (as K2E): int16 lanes 0..15 = cols 0,2,..,30 (even), lanes 16..31 = cols 1,3,..,31 (odd), matching the
++ * lo / hi nibble halves of the 16 weight bytes (byte j = cols 2j (low nibble), 2j+1 (high nibble)); scale float sa = 2^e per group, 0 for
++ * an all-zero block or an underflowing scale (documented edge, E8M0 would saturate at 2^-127).
++ **/
++#ifndef CPUINFER_OPERATOR_AVX2_MXFP4_B10_H
++#define CPUINFER_OPERATOR_AVX2_MXFP4_B10_H
++
++#include <immintrin.h>
++
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++#include "mxfp4-kernel.hpp"  // avx2kern::e8_table, ggml_bf16_t via avx2_bf16_utils.hpp
++
++namespace b10kern {
++
++// FP4 E2M1 * 2 as int8 (code bit 3 = sign).
++alignas(16) static constexpr int8_t kLutW2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
++
++// fl32(1/448): correctly rounded by the compiler's constant folding (no literal, so a mistyped constant cannot hide).
++static constexpr float kRcp448 = 1.0f / 448.0f;
++static inline float rcp448() { return kRcp448; }
++
++// Supported domain: activation block scale 2^kEMin .. 2^kEMax and E8M0 weight codes kCodeMin..kCodeMax. Inside it every factor
++// sa * ws * 2^-7 is a normal fp32 number (2^-117 .. 2^93), so all products are exact powers of two and no 0 * Inf / FTZ / flush case exists.
++// OUTSIDE the domain there is no approximation and no silent value: a non-zero block (or non-finite input) sets the sticky flag below (the
++// caller throws before the product is used) and the block scale becomes NaN; weight codes are rejected at load time and by NaN table entries.
++static constexpr int kEMin = -60, kEMax = 50;
++static constexpr int kCodeMin = 77, kCodeMax = 177;  // weight scale 2^-50 .. 2^50
++
++static inline std::atomic<int>& domain_flag() {
++  static std::atomic<int> f{0};
++  return f;
++}
++static inline bool domain_violation() { return domain_flag().load(std::memory_order_relaxed) != 0; }
++static inline void set_domain_violation() { domain_flag().store(1, std::memory_order_relaxed); }
++
++// Scale exponent e (E8M0: scale 2^e) from SF = fl32(amax * rcp448()), amax > 0 and finite. Returns false if e is outside kEMin..kEMax
++// (including an SF below normal fp32).
++static inline bool scale_exp(float amax, int* e) {
++  const float sf = amax * rcp448();
++  uint32_t u;
++  std::memcpy(&u, &sf, 4);
++  const int ex = (int)(u >> 23);          // biased exponent of SF (sf >= 0)
++  if (ex == 0 || ex == 255) return false;  // zero / denormal (< 2^-126) / inf / nan
++  const int ee = ex - 127 + ((u & 0x7FFFFFu) != 0 ? 1 : 0);  // ceil(log2(sf))
++  if (ee < kEMin || ee > kEMax) return false;
++  *e = ee;
++  return true;
++}
++
++static inline float pow2f(int e) {  // 2^e, e in [-127, 127]
++  uint32_t u = e >= -126 ? (uint32_t)(e + 127) << 23 : 0x00400000u;
++  float f;
++  std::memcpy(&f, &u, 4);
++  return f;
++}
++
++// RNE to the E4M3 grid (saturating) of fp32 values y with |y| <= 448 (already clamped); returns the grid value as fp32.
++static inline __m256 e4m3_grid(__m256 y) {
++  const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
++  const __m256 sgn = _mm256_andnot_ps(absm, y);
++  const __m256 a = _mm256_and_ps(y, absm);
++  // normal range (>= 2^-6): round the mantissa to 3 bits (RNE) with the integer trick; a carry may bump the exponent (correct)
++  const __m256i u = _mm256_castps_si256(a);
++  const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 20), _mm256_set1_epi32(1));
++  const __m256i r = _mm256_and_si256(_mm256_add_epi32(_mm256_add_epi32(u, _mm256_set1_epi32(0x7FFFF)), lsb),
++                                     _mm256_set1_epi32((int)0xFFF00000u));
++  const __m256 normal = _mm256_castsi256_ps(r);
++  // subnormal range (< 2^-6): grid step 2^-9, RNE via the FPU rounding mode (default nearest-even)
++  const __m256 sub = _mm256_mul_ps(_mm256_round_ps(_mm256_mul_ps(a, _mm256_set1_ps(512.0f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC),
++                                   _mm256_set1_ps(1.0f / 512.0f));
++  const __m256 is_sub = _mm256_cmp_ps(a, _mm256_set1_ps(1.0f / 64.0f), _CMP_LT_OQ);
++  return _mm256_or_ps(_mm256_blendv_ps(normal, sub, is_sub), sgn);
++}
++
++// One 32-group of bf16 -> int16 fixed point (even cols then odd cols) + scale sa. src: 32 bf16.
++static inline void quant_group(const ggml_bf16_t* src, int16_t* q, float* sa) {
++  const __m256i hm = _mm256_set1_epi32((int)0xFFFF0000u);
++  const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
++  const __m256i xa = _mm256_loadu_si256((const __m256i*)src);
++  const __m256i xb = _mm256_loadu_si256((const __m256i*)(src + 16));
++  const __m256 ea = _mm256_castsi256_ps(_mm256_slli_epi32(xa, 16));  // cols 0,2,..,14
++  const __m256 oa = _mm256_castsi256_ps(_mm256_and_si256(xa, hm));   // cols 1,3,..,15
++  const __m256 eb = _mm256_castsi256_ps(_mm256_slli_epi32(xb, 16));  // cols 16,..,30
++  const __m256 ob = _mm256_castsi256_ps(_mm256_and_si256(xb, hm));   // cols 17,..,31
++  __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_and_ps(ea, absm), _mm256_and_ps(oa, absm)),
++                           _mm256_max_ps(_mm256_and_ps(eb, absm), _mm256_and_ps(ob, absm)));
++  m = _mm256_max_ps(m, _mm256_permute2f128_ps(m, m, 1));
++  m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0x4E));
++  m = _mm256_max_ps(m, _mm256_shuffle_ps(m, m, 0xB1));
++  // non-finite input (Inf/NaN, any lane): fail loudly - the block scale becomes NaN so every output of this row is NaN
++  const __m256 lim = _mm256_set1_ps(3.4028234663852886e38f);
++  const __m256 badv = _mm256_or_ps(_mm256_or_ps(_mm256_cmp_ps(_mm256_and_ps(ea, absm), lim, _CMP_NLE_UQ), _mm256_cmp_ps(_mm256_and_ps(oa, absm), lim, _CMP_NLE_UQ)),
++                                   _mm256_or_ps(_mm256_cmp_ps(_mm256_and_ps(eb, absm), lim, _CMP_NLE_UQ), _mm256_cmp_ps(_mm256_and_ps(ob, absm), lim, _CMP_NLE_UQ)));
++  if (_mm256_movemask_ps(badv) != 0) {
++    set_domain_violation();
++    _mm256_storeu_si256((__m256i*)q, _mm256_setzero_si256());
++    _mm256_storeu_si256((__m256i*)(q + 16), _mm256_setzero_si256());
++    *sa = __builtin_nanf("");
++    return;
++  }
++  const float amax = _mm256_cvtss_f32(m);
++  if (!(amax > 0.0f)) {  // exact zero block (the only block that carries no scale)
++    _mm256_storeu_si256((__m256i*)q, _mm256_setzero_si256());
++    _mm256_storeu_si256((__m256i*)(q + 16), _mm256_setzero_si256());
++    *sa = 0.0f;
++    return;
++  }
++  int e = 0;
++  if (!scale_exp(amax, &e)) {  // non-zero block outside the supported scale domain: abort path (flag) + NaN scale
++    set_domain_violation();
++    _mm256_storeu_si256((__m256i*)q, _mm256_setzero_si256());
++    _mm256_storeu_si256((__m256i*)(q + 16), _mm256_setzero_si256());
++    *sa = __builtin_nanf("");
++    return;
++  }
++  const __m256 inv = _mm256_set1_ps(pow2f(-e));
++  const __m256 hi = _mm256_set1_ps(448.0f), lo = _mm256_set1_ps(-448.0f);
++  const __m256 k64 = _mm256_set1_ps(64.0f);
++  auto fix = [&](__m256 x) {
++    __m256 y = _mm256_max_ps(_mm256_min_ps(_mm256_mul_ps(x, inv), hi), lo);
++    return _mm256_cvtps_epi32(_mm256_mul_ps(e4m3_grid(y), k64));  // RNE (default rounding mode), exact for grid values >= 2^-3
++  };
++  const __m256i pe = _mm256_permute4x64_epi64(_mm256_packs_epi32(fix(ea), fix(eb)), 0xD8);  // even cols, order kept
++  const __m256i po = _mm256_permute4x64_epi64(_mm256_packs_epi32(fix(oa), fix(ob)), 0xD8);  // odd cols
++  _mm256_storeu_si256((__m256i*)q, pe);
++  _mm256_storeu_si256((__m256i*)(q + 16), po);
++  *sa = pow2f(e);
++}
++
++// Quantize one activation row of k columns (k % 32 == 0): q[k] int16, sa[k/32].
++static inline void quant_act(const ggml_bf16_t* src, int k, int16_t* q, float* sa) {
++  for (int g = 0; g < k / 32; g++) quant_group(src + (size_t)g * 32, q + (size_t)g * 32, sa + g);
++}
++
++// E8M0 code c -> 2^(c-127) * 2^-7 (the fixed-point unit 2^-6 and the doubled weights 2^-1 folded in): one table load per group.
++struct E8KTable {
++  float v[256];
++  E8KTable() {
++    // codes outside kCodeMin..kCodeMax are invalid for this kernel: NaN (also 0 * NaN = NaN), so a wrong weight scale can never pass silently
++    for (int c = 0; c < 256; c++) v[c] = (c >= kCodeMin && c <= kCodeMax) ? std::ldexp(1.0f, c - 134) : __builtin_nanf("");
++  }
++};
++static inline const float* e8k_table() {
++  static const E8KTable t;
++  return t.v;
++}
++
++// M activation rows (int16 + sa, row strides k int16 / k/32 floats) against weight rows [n0, n1).
++template <int M, bool E8>
++static void gemv(const int16_t* __restrict q, const float* __restrict sa, const uint8_t* __restrict b, const void* __restrict dv, int k,
++                 int n0, int n1, float* __restrict c, size_t c_stride) {
++  const __m128i lut = _mm_load_si128((const __m128i*)kLutW2);
++  const __m128i nib = _mm_set1_epi8(0x0F);
++  static_assert(E8, "KERN=3 needs the compact E8M0 weight scales (KT_DS41_MU_MXFP4_E8M0=1)");
++  const float* e8k = e8k_table();
++  const int G = k / 32;
++  const size_t rb = (size_t)k / 2;
++  for (int ni = n0; ni < n1; ni++) {
++    const uint8_t* br = b + (size_t)ni * rb;
++    const float* sf = E8 ? nullptr : (const float*)dv + (size_t)ni * G;
++    const uint8_t* se = E8 ? (const uint8_t*)dv + (size_t)ni * G : nullptr;
++    __m256 acc[M][4];
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++)
++      for (int j = 0; j < 4; j++) acc[mi][j] = _mm256_setzero_ps();
++    auto step = [&](int g, int j) __attribute__((always_inline)) {
++      const __m128i raw = _mm_loadu_si128((const __m128i*)(br + (size_t)g * 16));
++      const __m256i wa = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(lut, _mm_and_si128(raw, nib)));                    // even cols
++      const __m256i wb = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(raw, 4), nib)));  // odd cols
++      // weight scale * 2^-7 (2^-6 fixed-point unit * 2^-1 doubled weights), exact power of two
++      const __m256 wsv = _mm256_set1_ps(E8 ? e8k[se[g]] : sf[g] * (1.0f / 128.0f));
++#pragma GCC unroll 4
++      for (int mi = 0; mi < M; mi++) {
++        const int16_t* a = q + (size_t)mi * k + (size_t)g * 32;
++        const __m256i s32 = _mm256_add_epi32(_mm256_madd_epi16(_mm256_loadu_si256((const __m256i*)a), wa),
++                                             _mm256_madd_epi16(_mm256_loadu_si256((const __m256i*)(a + 16)), wb));
++        // exact int32 -> fp32 (|lane| < 2^24); scale = sa * (ws * 2^-7): powers of two (exact product), evaluated before the FMA
++        const __m256 f = _mm256_cvtepi32_ps(s32);
++        const __m256 sc = _mm256_mul_ps(_mm256_broadcast_ss(sa + (size_t)mi * G + g), wsv);
++        acc[mi][j] = _mm256_fmadd_ps(f, sc, acc[mi][j]);
++      }
++    };
++    int g = 0;
++    for (; g + 4 <= G; g += 4) {
++      step(g, 0);
++      step(g + 1, 1);
++      step(g + 2, 2);
++      step(g + 3, 3);
++    }
++    for (int j = 0; g < G; g++, j++) step(g, j);
++    // fixed reduction order ((a0 + a1) + (a2 + a3)); the empty asm pins each partial sum against -ffast-math re-association
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) {
++      __m256 s01 = _mm256_add_ps(acc[mi][0], acc[mi][1]);
++      __asm__("" : "+x"(s01));
++      __m256 s23 = _mm256_add_ps(acc[mi][2], acc[mi][3]);
++      __asm__("" : "+x"(s23));
++      __m256 s = _mm256_add_ps(s01, s23);
++      __asm__("" : "+x"(s));
++      c[mi * c_stride + ni] = avx2::hsum_avx2(s);
++    }
++  }
++}
++
++}  // namespace b10kern
++
++#endif
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-18 12:44:34.827817996 +0200
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-18 13:14:42.569637438 +0200
+@@ -28,6 +28,7 @@
+ #include "moe_base.hpp"
+ #include "mxfp4-kernel.hpp"  // AVX2 MXFP4 decode kernel and E8M0 scale paths
+ #include "mxfp4-decode-kernel.hpp"  // Exact decode variant (KT_DS41_MU_DECODE_KERNEL): bit-identical decode variant for the KERN=1 m <= 2 path
++#include "mxfp4-b10.hpp"  // B10 (KT_DS41_MU_MXFP4_KERNEL=3): E4M3 activation (W4A8, GPU recipe), not bit-identical, gates required
+ #include "../../cpu_backend/k2eplus_env.h"  // CPU expert optimization (KT_DS41_MU_K2EPLUS)
+ 
+ #include <atomic>
+@@ -152,6 +153,8 @@
+     int perm_m = 0;
+     // Q8 mode stores the activation in perm as int8 rows followed by fp32 half-block scales.
+     bool perm_is_q8 = false;
++    // B10 KERN=3: perm holds the E4M3 activation as int16 fixed point (rows) followed by fp32 block scales instead of fp32.
++    bool perm_is_e4 = false;
+     static constexpr int kPermMinRows = 16;
+     size_t max_m = 0, k = 0;
+ 
+@@ -176,7 +179,19 @@
+       std::memcpy(data + (size_t)m_start * k, src + (size_t)m_start * k,
+                   (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
+       perm_is_q8 = false;
++      perm_is_e4 = false;
+       if (perm == nullptr || m < kPermMinRows) {
++        // B10 KERN=3: E4M3 activation (int16 fixed point per 32-block + fp32 scale) for the 1-3 row path, rows at
++        // perm + mi * k int16, scales behind all max_m rows. Fits: perm has max_m * k * 4 bytes, needed 2.125 * max_m * k.
++        if (perm != nullptr && m <= 3 && (k % 32) == 0 && avx2kern::kern_mode() == 3) {
++          int16_t* q = (int16_t*)perm;
++          float* sa = (float*)(q + max_m * k);
++          for (int mi = m_start; mi < m_end; mi++)
++            b10kern::quant_act(src + (size_t)mi * k, (int)k, q + (size_t)mi * k, sa + (size_t)mi * (k / 32));
++          perm_m = m;
++          perm_is_e4 = true;
++          return;
++        }
+         // Q8 activation layout for the 1-3 row path: int8 values per 32-element block plus fp32 scales, with rows at
+         // perm + mi * k bytes, scales behind all max_m rows. Fits: perm has max_m * k * 4 bytes.
+         if (perm != nullptr && m <= 3 && (k % 32) == 0 && avx2kern::kern_mode() == 2) {
+@@ -313,6 +328,24 @@
+   // Small-batch decode kernel (KT_DS41_MU_MXFP4_KERNEL>=1): 1-3 activation rows, group 32, activation pre-permuted by
+   // BufferA::from_mat. Per (row, activation) the arithmetic equals the single-row loop of the fast
+   // path below, so the output is bit-identical; E8M0 only changes where the (same) scale is read.
++  if (a.perm_is_e4) {
++    // B10 KERN=3 (E4M3 activation, not bit-identical; gates required). Only reachable for group 32.
++    if (!(group_size == 32 && (k % 32) == 0 && m >= 1 && m <= 3 && a.perm != nullptr && a.perm_m >= m))
++      throw std::runtime_error("KT_DS41_MU_MXFP4_KERNEL=3: E4M3 activation but unsupported shape (needs group 32, m <= 3)");
++    if (b.e8 == nullptr) throw std::runtime_error("KT_DS41_MU_MXFP4_KERNEL=3: needs the compact E8M0 weight scales (KT_DS41_MU_MXFP4_E8M0=1)");
++    // sticky flag set by the quantizer for a non-zero block outside the supported scale domain / non-finite input (fail-closed abort)
++    if (b10kern::domain_violation())
++      throw std::runtime_error("KT_DS41_MU_MXFP4_KERNEL=3: DOMAIN_VIOLATION (activation scale outside 2^-60..2^50 or non-finite input), aborting");
++    const void* dv = (const void*)b.e8;
++    const int16_t* q = (const int16_t*)a.perm;
++    const float* sa = (const float*)(q + a.max_m * a.k);
++    switch (m) {
++      case 1: b10kern::gemv<1, true>(q, sa, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      case 2: b10kern::gemv<2, true>(q, sa, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++      default: b10kern::gemv<3, true>(q, sa, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
++    }
++    return;
++  }
+   if (a.perm_is_q8) {
+     // Q8 activation is not bit-identical and must pass its quality gates. Only reachable for group size 32.
+     if (!(group_size == 32 && (k % 32) == 0 && m >= 1 && m <= 3 && a.perm != nullptr && a.perm_m >= m))
+@@ -810,6 +843,8 @@
+       kern_logged = true;
+       printf("[KERN] KT_DS41_MU_MXFP4_KERNEL=%d KT_DS41_MU_MXFP4_E8M0=%d (0/0 = legacy path; 2 = Q8, not bit-identical)\n",
+              avx2kern::kern_mode(), (int)avx2kern::e8m0_mode());
++      if (avx2kern::kern_mode() == 3)
++        printf("[B10] KT_DS41_MU_MXFP4_KERNEL=3: E4M3 activation (W4A8, GPU recipe), int16 fixed-point kernel, not bit-identical; numerical and quality gates required\n");
+       if (avx2kern::e8m0_mode() && avx2kern::kern_mode() < 1)
+         printf("[KERN] KT_DS41_MU_MXFP4_E8M0=1 without KT_DS41_MU_MXFP4_KERNEL>=1 is ineffective (no e8m0 copy)\n");
+       printf("[K2EPLUS] KT_DS41_MU_K2EPLUS stages=0x%02x (0 = legacy; arithmetic matches the KERN path, bit-identical)\n",
+@@ -947,7 +982,11 @@
+       avx2::store_fp32_to_bf16(gp + q, result);
+     }
+     typename T::BufferA& ha = k2p_ha_[s];
+-    if (kern == 2) {
++    if (kern == 3) {
++      int16_t* q = (int16_t*)ha.perm;
++      float* sa = (float*)(q + ha.max_m * ha.k);
++      b10kern::quant_act(gp, 32, q + (size_t)g * 32, sa + g);
++    } else if (kern == 2) {
+       int8_t* q = (int8_t*)ha.perm;
+       float* da = (float*)(q + ha.max_m * ha.k);
+       avx2kern::quant_act_q8(gp, 32, q + (size_t)g * 32, da + g);
+@@ -984,7 +1023,7 @@
+     if (!(k2p::on(k2p::EPI) || k2p::on(k2p::BAL))) return false;
+     const int kern = avx2kern::kern_mode();
+     const int H = config_.hidden_size, I = config_.intermediate_size;
+-    if (!(kern == 1 || kern == 2) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
++    if (!(kern == 1 || kern == 2 || kern == 3) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
+     if (k > 64) return false;
+     int slot_e[kK2PSlots];
+     int slot_of_j[64];
+@@ -1015,6 +1054,7 @@
+       for (int s = 0; s < a; s++) {
+         k2p_ha_[s].perm_m = 1;
+         k2p_ha_[s].perm_is_q8 = (kern == 2);
++        k2p_ha_[s].perm_is_e4 = (kern == 3);  // B10
+       }
+       if (bal)
+         for (int i = 0; i < a * G; i++) k2p_cnt_[i].store(0, std::memory_order_relaxed);
+@@ -1162,7 +1202,11 @@
+         __m256 result = avx2::act_fn(gate_val, up_val, lim, alpha);
+         avx2::store_fp32_to_bf16(gp + q, result);
+       }
+-      if (ha.perm_is_q8) {
++      if (ha.perm_is_e4) {
++        int16_t* q = (int16_t*)ha.perm;
++        float* sa = (float*)(q + ha.max_m * ha.k);
++        b10kern::quant_act(gp, 32, q + (size_t)mi * I + (size_t)g * 32, sa + (size_t)mi * (I / 32) + g);
++      } else if (ha.perm_is_q8) {
+         int8_t* q = (int8_t*)ha.perm;
+         float* da = (float*)(q + ha.max_m * ha.k);
+         avx2kern::quant_act_q8(gp, 32, q + (size_t)mi * I + (size_t)g * 32, da + (size_t)mi * (I / 32) + g);
+@@ -1175,7 +1219,7 @@
+   bool k2p_bs(int qlen, int k, const int64_t* expert_ids, const float* weights, void* output, int a) {
+     const int kern = avx2kern::kern_mode();
+     const int H = config_.hidden_size, I = config_.intermediate_size, G = I / 32;
+-    if (!(kern == 1 || kern == 2) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
++    if (!(kern == 1 || kern == 2 || kern == 3) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
+     if (qlen < 1 || qlen >= 10 || a < 1) return false;
+     const int* emap = this->m_expert_id_map_.data();
+     int mmax = 0;
+@@ -1196,6 +1240,7 @@
+       const int m = m_local_num_[e];
+       typename T::BufferA& ha = *down_ba_[e];
+       ha.perm_is_q8 = (kern == 2 && m <= 3);
++      ha.perm_is_e4 = (kern == 3 && m <= 3);  // B10
+       ha.perm_m = m;
+     }
+     for (size_t i = 0; i < (size_t)a * G; i++) k2p_bcnt_[i].store(0, std::memory_order_relaxed);
+@@ -1636,6 +1681,8 @@
+               for (size_t q = 0; q < cnt; q++) {
+                 const int e = avx2kern::f32_to_e8m0_exact(bb.d[q]);
+                 if (e < 0) { n_fb++; return; }
++                if (avx2kern::kern_mode() == 3 && (e < b10kern::kCodeMin || e > b10kern::kCodeMax))
++                  throw std::runtime_error("KT_DS41_MU_MXFP4_KERNEL=3: E8M0 weight scale code outside 77..177 (unsupported by the B10 kernel)");
+                 dst[q] = (uint8_t)e;
+               }
+               bb.e8 = dst;

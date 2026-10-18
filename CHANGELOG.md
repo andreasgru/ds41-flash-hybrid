@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.2.0-b10-v6 — source reconstruction candidate
+
+- Add the B10 CPU kernel3 on the pinned DK/Arena base; retain K22b GPU expert decode, command arguments and memory limits. DK selectors remain exported but do not select kernel3.
+- Reconstruct the eight-patch tree and add the independent B10 environment comparator. Preserve prior stage commits and tags.
+- Report the fixed 18 October ten-start historical cohort separately for models1016 (n7) and1017 (n3), including both m8 readings, partial quality counts and separate arithmetic retries. Raw data remain internal.
+- Native rebuilding and positive deployment remain untested; five historical full-load gates stay red.
+
 ## v3.1.1-k22b — documentation consistency
 
 - Resolve conflicting validation wording across the six documents. Product code, tests, source patches and runtime pins remain unchanged.
@@ -45,4 +52,6 @@ Public r3 release. README wording and checksum updates only; code, patches, conf
 
 Initial r3 source release candidate with the compatibility baseline, neutral multi-user layer, portable build/launch tools and real-input regression suites. Historical full-load performance gates remained red.
 
-Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+Historical K22b verification record (product code at v3.1.1-k22b): the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+
+B10-v6 current-stage evidence: the first 18 offline tests passed in 28.133 s against eight patches and 81 runtime pins (63 source files). The independent B10 oracle retains 93 environment entries plus the permitted port and 74 command arguments; only the selected kernel value changes from 1 to 3 relative to K22b. Static interface checks found 14 readers and detected the removed-reader/state-key controls. The actual print path accepted default/zero workspace settings and rejected half-chunk/double-chunk/invalid overrides. These additional verification scripts and logs are internal and are not published. Native rebuilding, GPU inference and live service remain untested; no pass is implied.

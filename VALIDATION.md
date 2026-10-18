@@ -1,6 +1,6 @@
 # Validation and explicit limits
 
-**K22b candidate `v3.1.1-k22b`: source reconstruction and 18 offline real-input tests passed.** The K22b WSL log reports `Ran 18 tests in 27.895s` and `OK`: 12 archive/source plus six runtime-configuration methods against the seven-patch series and current 80 pins. Static interface and actual print-path workspace counterchecks passed. The preceding K22 18-test result is separate historical evidence. Native rebuilding, GPU execution, server startup and full workload acceptance remain untested.
+**B10-v6 candidate `v3.2.0-b10-v6`: eight-patch source reconstruction and 18 offline real-input tests passed.** See the current-stage evidence below. All following K22b-specific results remain historical evidence for that earlier stage.
 
 ## Required real inputs and existing suites
 
@@ -30,7 +30,7 @@ The preserved independent K22 oracle derives its expectations from the preserved
 
 These suites reject changed source/native bytes and exercise actual endpoint validation. They use neither native stubs, fake packages, fabricated server responses nor monkeypatched functions. Tokenizer, live resource/parser and service behavior require their real operating environments; no replacement response certifies them.
 
-## Source reconstruction and pin coverage
+## Historical K22b source reconstruction and pin coverage
 
 The seven-patch series contains four r3 patches, two K22 patches and one K22b SGLang patch. Fresh application reproduced 10,409 regular files and five symlink targets. Four new overlay files reverse to their pinned originals; three accompanying standard originals match K22. The result binds the preceding 56-file reversal. Three fail-closed controls reject missing inputs, a corrupt patch and an existing output. Runtime coverage is 80 pins: 62 source files, seven FP8 configurations, three adapter files, placement and seven runtime helpers. The final 18-test K22b archive/runtime pass is separate evidence; neither result establishes native execution. Static interface and actual print-path workspace counterchecks passed.
 
@@ -58,17 +58,21 @@ The fixed A1_B12X_DECODE and A1_B12X_STREAM_CUTLASS flags had no readers in the 
 
 ## Untested positive deployment paths
 
-- Native KT/CUDA compilation of the renamed K22b sources and environment interfaces.
+- Native KT/CUDA compilation of the renamed B10 sources and environment interfaces.
 - GPU execution, model loading, live health/parser readiness and inference.
 - Actual tokenizer and complete standard warmup against a real service.
 - Full 52-shard hashing and positive model-readiness receipt creation.
 - Positive Engram-header/offset manifest generation with actual weights.
 - Positive full dependency-readiness receipt creation in a serving environment.
 - Real systemd start, rollback, handoff, signals and StopPost.
-- New benchmarks and complete intended-workload acceptance for the public K22b candidate.
+- New benchmarks and complete intended-workload acceptance for the public B10 candidate.
 
 The historical v2/r3 load acceptance remains **RED on all five performance gates**, with sample counts retained in README. Quality stages after its HALT were not run. The separate K22/K22b short quality sets do not complete those missing stages or replace full acceptance.
 
-Source byte equality is against the derived cleaned target. The four K22b overlay reversals were executed for this stage; the earlier 56-file K22 reversal journal is pinned and inherited, rather than rerun as part of the K22b build. Supplied standard inputs match both their pinned raw K22 counterparts and, after cleanup, the derived K22 files.
+Historical K22b source byte equality is against its derived cleaned target. The four K22b overlay reversals were executed for this stage; the earlier 56-file K22 reversal journal is pinned and inherited, rather than rerun as part of the K22b build. Supplied standard inputs match both their pinned raw K22 counterparts and, after cleanup, the derived K22 files.
 
-Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+Historical K22b verification record (product code at v3.1.1-k22b): the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+
+B10-v6 current-stage evidence: the first 18 offline tests passed in 28.133 s against eight patches and 81 runtime pins (63 source files). The independent B10 oracle retains 93 environment entries plus the permitted port and 74 command arguments; only the selected kernel value changes from 1 to 3 relative to K22b. Static interface checks found 14 readers and detected the removed-reader/state-key controls. The actual print path accepted default/zero workspace settings and rejected half-chunk/double-chunk/invalid overrides. These additional verification scripts and logs are internal and are not published. Native rebuilding, GPU inference and live service remain untested; no pass is implied.
+
+B10 source equality is against the derived cleaned target: 10,410 files and five links, with two newly reversed B10 native files. Four K22b and 56 K22 raw reversals are inherited by pinned journals. Three fail-closed source controls passed. Historical B10 measurement definitions, fixed cohort date, tool hashes, separate model populations and both m8 readings are in README. Numerical-reference capture for model1017 is not a G2 verdict. All five historical full-load gates remain red.

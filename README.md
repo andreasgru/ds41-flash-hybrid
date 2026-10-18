@@ -1,26 +1,44 @@
 # ds41-flash-hybrid
 
-K22b source release candidate, tag `v3.1.1-k22b`, for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. It extends K22 with GPU-resident expert B12X W4A16 decode through a four-file source overlay. DK CPU decode, dense MXFP8 decode and A1 expert-cache swapping remain selected. Weights, Engram data, runtime environments and native binaries are supplied separately.
+B10-v6 source release candidate, tag `v3.2.0-b10-v6`, for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. B10 adds CPU kernel 3 on the DK/Arena source base, retaining the K22b GPU-resident expert B12X W4A16 decode and streamed CUTLASS prefill. Weights, Engram data, runtime environments and native binaries are supplied separately.
 
-**Status: K22b source reconstruction and 18 offline real-input tests passed.** Static interface and actual print-path workspace counterchecks passed. Native rebuilding, GPU execution, server startup and full workload acceptance have not been validated for this candidate. Historical measurements describe the recorded implementation, not a newly built public release.
+**Status: source reconstruction and 18 offline real-input tests passed.** Static interface and actual print-path workspace counterchecks passed. Native rebuilding, GPU execution, server startup and full workload acceptance remain untested. Historical measurements describe recorded implementations, not a newly built public artifact.
 
 The intended workload remains 1–2 main sessions approaching 500k tokens plus 4–6 subordinate sessions. The historical full-load run used one main and four subordinate sessions and failed five performance gates.
 
-## K22b profile
+## B10-v6 profile
 
 Recorded hardware: RTX PRO 6000 Blackwell Max-Q, 96 GB; two EPYC 7302 CPUs; approximately 499 GiB host RAM visible to the operating system.
 
-The portable profile keeps the existing placement, server options, 524,288-token context limit, 1,800,000-token pool, 16,384-token prefill chunks, 1,024-token streaming threshold, SWA/full ratio 0.0625, GPU memory fraction 0.90, 90 GPU experts, 28 CPU inference threads and at most 12 requests. Decode graph batches remain 1–12. HiCache and speculation remain disabled; NUMA nodes are 0/1.
+The portable profile retains placement and server options: context 524,288, token pool 1,800,000, prefill chunk 16,384, streaming threshold 1,024, SWA/full ratio 0.0625, GPU memory fraction 0.90, 90 GPU experts, 28 CPU inference threads, at most 12 requests and graph batches 1–12. HiCache and speculation stay disabled; NUMA nodes are 0/1.
 
-K22b retains `DS41_CBPKG=multi-user-dk` with `KT_DS41_MU_DECODE_KERNEL=1`, `KT_DS41_MU_DECODE_PREFETCH=2048` and `KT_DS41_MU_K2EPLUS=1`. Dense FP8 operations use `SGLANG_DS41_MU_MXFP8_B12X=1`. A1 uses CACHE=1, SWAP=1, BUDGET=2, STAT_S=1, RING=32 and STAGER=1 under the `SGLANG_DS41_MU_A1_` prefix. Sources remain under `sources/` and the native package under `package/`.
+`KT_DS41_MU_MXFP4_KERNEL=3` selects B10 E4M3 activation quantization (W4A8) with `KT_DS41_MU_MXFP4_E8M0=1`. This path is not bit-identical to the preceding decode path; numerical and quality gates remain required. `DS41_CBPKG=multi-user-dk` remains the package selector. The inherited DECODE_KERNEL=1 and DECODE_PREFETCH=2048 settings have source readers, but their DK decode dispatch requires kernel 1 and does not select B10 kernel 3. K2EPLUS=1 retains the expert pipeline. Dense FP8 operations separately use `SGLANG_DS41_MU_MXFP8_B12X=1`.
 
-The native module supports shared storage, but this profile fixes shared expert storage and zero-copy off. A1 reads checkpoint experts. `A1_SOURCE=ckpt` is exposed as an additional configuration marker; the implementation constructs the checkpoint reader directly. This marker is an explicit difference from the historical environment export. Exact environment-byte equivalence is not claimed.
+A1 keeps CACHE=1, SWAP=1, BUDGET=2, STAT_S=1, RING=32 and STAGER=1 under `SGLANG_DS41_MU_A1_`. GPU-resident expert slots use B12X W4A16 and streamed prefill stays on CUTLASS. All 14 selected extension switches have static readers; this does not imply that retained DK switches affect kernel 3. K22 lacked the GPU-expert B12X readers; its dense MXFP8 path was separately active.
 
-K22b gives `SGLANG_DS41_MU_A1_B12X_DECODE=1` and `SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS=1` real readers: GPU-resident expert slots use B12X W4A16, while streamed prefill stays on CUTLASS. All 12 selected extension switches now have source readers. The preceding K22 stage set these same two flags without readers and therefore lacked GPU expert B12X decode; its separate dense MXFP8 B12X path was active.
+Shared expert storage and zero-copy remain off; A1 reads checkpoint experts. `A1_SOURCE=ckpt` is an additional visible marker for the hardcoded checkpoint reader, not a selectable reader implementation. Exact historical environment-byte equality is not claimed. `SGLANG_DS41_MU_A1_B12X_WORKSPACE_TOKENS` stays unset or zero; capacity follows the prefill chunk with fallback 16384. Nonzero overrides are rejected.
 
-`SGLANG_DS41_MU_A1_B12X_WORKSPACE_TOKENS` remains unset or zero, selecting the actual prefill chunk size, with a 16384-token fallback. A nonzero inherited override is rejected by the fixed profile. No new native module, server argument, placement or memory setting is selected by this source-only stage change.
+The service limit remains 480 GiB with no swap; preflight requires 465 GiB available. Stop thresholds remain 60 GiB global available memory, 2 GiB on either NUMA node, 1 GiB swap growth and 460 GiB anonymous/shared memory. Ownership and control-group cleanup remain in place. See [CONFIGURATION](CONFIGURATION.md).
 
-The service limit is 480 GiB with no swap. Preflight requires 465 GiB available host memory. Existing stop thresholds are available memory below 60 GiB, either NUMA node below 2 GiB, swap growth above 1 GiB, or anonymous/shared memory above 460 GiB. Ownership checks and control-group cleanup remain in place. See [CONFIGURATION](CONFIGURATION.md).
+## Historical B10-v6 measurements — 18 October 2026
+
+The fixed cohort contains all ten complete archived starts selected for this comparison: seven with model revision 1016 and three with revision 1017. Earlier auxiliary starts and the following start are excluded. Values were computed on Linux from internal archives by the reviewed `b10-band-v2` tool (source SHA256 `3863fb38c7ffd5e7a87feee9489ae6f5f440416c5f3554d46b7864407aa0464b`; tool archive SHA256 `b68846e18460896eba643fcd3d8d236f843b30463f8d6bea7f910abb9515ac2e`). Raw measurement data are internal and are not published. Each cell is min / median / max across starts, in tokens/s.
+
+| Metric | Model 1016, n=7 starts | Model 1017, n=3 starts |
+|---|---:|---:|
+| bs1x20, 20 measured + 1 excluded warmup | 63.470 / 63.741 / 64.432 | 64.503 / 64.523 / 64.657 |
+| Decode bs1, all 6 including warmup | 64.523 / 64.623 / 64.734 | 65.128 / 65.233 / 65.492 |
+| Decode bs4, all 6 including warmup | 103.687 / 106.003 / 108.317 | 110.514 / 110.659 / 110.713 |
+| Decode bs8, all 6 including warmup | 193.413 / 200.878 / 205.069 | 204.968 / 210.257 / 214.920 |
+| m8_median_22, aligned, includes 2 warmups | 140.462 / 141.504 / 142.275 | 142.294 / 143.110 / 143.140 |
+| Aligned m8, 20 measured | 140.591 / 142.018 / 142.488 | 142.549 / 143.414 / 143.541 |
+| qprobe2 partial correct count / 88 | 75 / 76 / 76 | 76 / 76 / 76 |
+| Separate JSON validity / 10 | 10 / 10 / 10 | 10 / 10 / 10 |
+| Arithmetic first attempt / 36 | 36 / 36 / 36 | 35 / 35 / 36 |
+
+bs1x20 uses the same synthetic prompt, output length 256 and thinking disabled. Decode has five measured repetitions and one warmup; the legacy extractor includes all six. m8 uses eight distinct synthetic prompts and aligned-stream rates; its 22-record median includes two warmups while the independently recomputed 20-record metric excludes them. The unaligned reading is invalid for staggered starts. These short repeated synthetic-load starts are not full workload acceptance or a controlled statistical trial.
+
+The qprobe2 correct count excludes the separately counted JSON tasks; it is a partial count, not a complete quality score. Two model-1017 starts scored 35/36 arithmetic initially and passed an allowed one-item retry (1/1), reported separately; the third scored 36/36 without retry. Model-1017 numerical-reference data were captured without a G2 verdict against the model-1016 reference. No 1017 numerical-gate pass or standard change is implied. No ranges from other cohorts are included in this table.
 
 ## Historical K22b measurements
 
@@ -75,7 +93,7 @@ Future acceptance uses `sum(min(C,U))/sum(U)`, where C is server-reported cached
 
 ## Sources, preparation and build
 
-Archive revisions, SHA256 and exact download URLs are maintained in `pins/upstream.json`. The seven-patch series comprises four r3 patches, two K22 patches and the K22b four-file SGLang overlay. Fresh application reproduced 10,409 regular files and five symlink targets against the cleaned K22b target. The four new overlay files reverse to their pinned originals; three accompanying standard originals match K22 byte-for-byte. This extends the earlier 56-file K22 reversal, with three fail-closed controls. Runtime coverage is 62 source files and 80 total pins. These are source-reconstruction checks; the first K22b 18-test offline run passed separately. Static interface and actual print-path workspace counterchecks passed. FlashInfer entries record external runtime provenance and are not extracted by this series.
+Archive revisions, SHA256 and exact download URLs are in `pins/upstream.json`. The eight-patch series contains four r3 patches, two K22 patches, the K22b SGLang overlay and the B10 native patch. Fresh application reproduced 10,410 regular files and five symlink targets against the derived cleaned B10 target. Both B10 native files were freshly reversed to pinned raw originals; the earlier K22b four-file and K22 56-file reversal journals are pinned and inherited, not rerun in this stage. The Arena-qualified base equals K22b before the B10 patch. Three fail-closed controls passed. Runtime coverage is 63 source files and 81 total pins. FlashInfer entries record external runtime provenance and are not extracted by this series.
 
 Own options use `SGLANG_DS41_MU_*` and `KT_DS41_MU_*`; internal identifiers use the existing neutral DS41MU naming convention. Genuine upstream and recipe interfaces retain their names.
 
@@ -91,7 +109,7 @@ bash scripts/build-native.sh --print-plan
 bash scripts/build-native.sh --build
 ```
 
-The preparation tools verify archive and patch pins, reject existing destinations and publish only after successful preparation. The native build verifies source pins, builds the KT extension and CPU adapter with one job, then creates the actual ABI/artifact receipt. Its DK recipe explicitly disables AVX512, the llama.cpp CUDA backend and optional llama.cpp test/example/server builds while retaining AVX2/FMA/F16C and the KTransformers CUDA extension. The renamed native build remains untested for K22b.
+The preparation tools verify archive and patch pins, reject existing destinations and publish only after successful preparation. The native build verifies source pins, builds the KT extension and CPU adapter with one job, then creates the actual ABI/artifact receipt. Its native recipe explicitly disables AVX512, VNNI, BF16 and VBMI, the llama.cpp CUDA backend and optional llama.cpp test/example/server builds while retaining AVX2/FMA/F16C and the KTransformers CUDA extension. The historical B10 tempo module used CUDA 13.2.86 and GCC 15.2; serving paths retain CUDA 13.3. The portable renamed native build remains untested; byte-identical rebuilding is not claimed. The tempo recipe omits the compile macro `K2P_TRACE`; this is not a runtime environment knob.
 
 ## Readiness and launch
 
@@ -111,13 +129,13 @@ bash scripts/start-standard.sh --start-standard
 
 The shard receipt binds the exact checksum-list digest and shard set, not the publisher's identity. Keep verified weights immutable. The Engram producer reads the real model index and safetensors headers for exact weight/scale offsets without extracting tensor payloads. Its index must come from the same trusted distribution; the shard receipt does not cover that index. Runtime manifests remain local.
 
-Runtime readiness verifies the build receipt and discovers required packages without importing them. Discovery is not a functional server check. The resolver checks source, placement, native ELF, Python ABI and receipts; the starter reserves the configured lock, waits for health and parser readiness, then requests exact 32k and 8k synthetic warmups. All positive deployment paths remain untested for this K22b candidate. Do not create readiness receipts manually.
+Runtime readiness verifies the build receipt and discovers required packages without importing them. Discovery is not a functional server check. The resolver checks source, placement, native ELF, Python ABI and receipts; the starter reserves the configured lock, waits for health and parser readiness, then requests exact 32k and 8k synthetic warmups. All positive deployment paths remain untested for this B10 candidate. Do not create readiness receipts manually.
 
 The endpoint defaults to numeric IPv4 loopback, port 18081 and device ordinal 0; ::1 is supported with bracketed URLs. Startup and readiness use the same endpoint. Stop only the exact unit recorded in the selected run's `unit.txt`; StopPost releases its reservation. Handoff requires a retained reservation and a stopped prior unit.
 
 ## Checks and limits
 
-The K22b WSL run passed 18 real-input tests: 12 archive/source and six runtime-configuration methods using the seven-patch series and current 80-pin set. It compared the selected 93 oracle environment entries, including the explicit checkpoint marker, plus the permitted port setting and all 74 command arguments. Genuine CPython 3.12.11, the historical native ELF and a genuine row-store library support offline ABI/configuration checks only; these are not a native rebuild or inference test. The preceding K22 18-test pass is retained separately. Static interface and actual print-path workspace counterchecks passed. See [VALIDATION](VALIDATION.md) for scope and limits.
+The first B10 WSL run passed 18 real-input tests in 28.133 s: 12 archive/source and six runtime-configuration methods against eight patches and 81 pins. It compared 93 independent oracle environment entries plus the port setting and 74 command arguments. Genuine CPython 3.12.11, historical B10 native ELF `87b1314b` and a genuine row-store library support offline ABI/configuration checks only. Static interface and actual print-path workspace counterchecks passed. See [VALIDATION](VALIDATION.md).
 
 ## Credits and licenses
 
@@ -127,12 +145,16 @@ Weights are not redistributed; the tooling license grants no model/data rights. 
 
 ## Versions
 
+- `v3.2.0-b10-v6`: B10 CPU kernel 3, K22b GPU expert path and fixed ten-start historical measurement cohort.
+
 - `v3.1.1-k22b`: documentation consistency update; product code and tests unchanged.
 - `v3.1.0-k22b`: internal only, superseded by v3.1.1-k22b (documentation consistency).
 - `v3.0.0-k22`: K22 source candidate; source reconstruction and 18 offline real-input tests passed. Native rebuilding and deployment remain untested.
 - `v2.1.1` (8 October 2026): public r3 release; documentation/checksum update, with code and patches unchanged from v2.1.
 - `v2.1` (3 October 2026): r3 source release candidate.
 
-Source byte equality is against the derived cleaned target. The four K22b overlay reversals were executed for this stage; the earlier 56-file K22 reversal journal is pinned and inherited, rather than rerun as part of the K22b build. Supplied standard inputs match both their pinned raw K22 counterparts and, after cleanup, the derived K22 files.
+Historical K22b source byte equality is against its derived cleaned target. The four K22b overlay reversals were executed for that earlier stage; the earlier 56-file K22 reversal journal is pinned and inherited, rather than rerun as part of the K22b build. Supplied standard inputs match both their pinned raw K22 counterparts and, after cleanup, the derived K22 files.
 
-Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+Historical K22b verification record (product code at v3.1.1-k22b): the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
+
+B10-v6 current-stage evidence: the first 18 offline tests passed in 28.133 s against eight patches and 81 runtime pins (63 source files). The independent B10 oracle retains 93 environment entries plus the permitted port and 74 command arguments; only the selected kernel value changes from 1 to 3 relative to K22b. Static interface checks found 14 readers and detected the removed-reader/state-key controls. The actual print path accepted default/zero workspace settings and rejected half-chunk/double-chunk/invalid overrides. These additional verification scripts and logs are internal and are not published. Native rebuilding, GPU inference and live service remain untested; no pass is implied.
