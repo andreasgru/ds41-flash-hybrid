@@ -148,7 +148,7 @@ Weights are not redistributed; the tooling license grants no model/data rights. 
 - `v3.2.0-b10-v6`: B10 CPU kernel 3, K22b GPU expert path and fixed ten-start historical measurement cohort.
 
 - `v3.1.1-k22b`: documentation consistency update; product code and tests unchanged.
-- `v3.1.0-k22b`: internal only, superseded by v3.1.1-k22b (documentation consistency).
+- `v3.1.0-k22b`: internal, not published; superseded by v3.1.1-k22b (documentation consistency).
 - `v3.0.0-k22`: K22 source candidate; source reconstruction and 18 offline real-input tests passed. Native rebuilding and deployment remain untested.
 - `v2.1.1` (8 October 2026): public r3 release; documentation/checksum update, with code and patches unchanged from v2.1.
 - `v2.1` (3 October 2026): r3 source release candidate.

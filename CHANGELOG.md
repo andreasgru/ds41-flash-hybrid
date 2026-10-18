@@ -11,9 +11,9 @@
 
 - Resolve conflicting validation wording across the six documents. Product code, tests, source patches and runtime pins remain unchanged.
 - Cite the final 27.895-second test run and the actual interface/workspace evidence scope. Additional verification scripts and evidence logs are internal and are not published.
-- v3.1.0-k22b internal only, superseded by v3.1.1-k22b (documentation consistency).
+- v3.1.0-k22b internal, not published; superseded by v3.1.1-k22b (documentation consistency).
 
-## v3.1.0-k22b — source reconstruction candidate
+## v3.1.0-k22b — internal, not published; superseded by v3.1.1-k22b
 
 Status: **K22b source reconstruction and 18 offline real-input tests passed**. Static interface and actual print-path workspace counterchecks passed.
 
