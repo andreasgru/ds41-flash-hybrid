@@ -1,4 +1,4 @@
-Long-context inference with CPU expert offload — K22b source release candidate v3.1.0-k22b
+Long-context inference with CPU expert offload — K22b source release candidate v3.1.1-k22b
 
 Own portable tooling and patch modifications are licensed under Apache-2.0. Upstream copyright notices remain in source and patches. This notice does not replace upstream licenses and does not grant rights to model weights.
 

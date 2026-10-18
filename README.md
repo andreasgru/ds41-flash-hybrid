@@ -1,6 +1,6 @@
 # ds41-flash-hybrid
 
-K22b source release candidate, tag `v3.1.0-k22b`, for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. It extends K22 with GPU-resident expert B12X W4A16 decode through a four-file source overlay. DK CPU decode, dense MXFP8 decode and A1 expert-cache swapping remain selected. Weights, Engram data, runtime environments and native binaries are supplied separately.
+K22b source release candidate, tag `v3.1.1-k22b`, for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. It extends K22 with GPU-resident expert B12X W4A16 decode through a four-file source overlay. DK CPU decode, dense MXFP8 decode and A1 expert-cache swapping remain selected. Weights, Engram data, runtime environments and native binaries are supplied separately.
 
 **Status: K22b source reconstruction and 18 offline real-input tests passed.** Static interface and actual print-path workspace counterchecks passed. Native rebuilding, GPU execution, server startup and full workload acceptance have not been validated for this candidate. Historical measurements describe the recorded implementation, not a newly built public release.
 
@@ -127,9 +127,12 @@ Weights are not redistributed; the tooling license grants no model/data rights. 
 
 ## Versions
 
-- `v3.1.0-k22b`: K22b source reconstruction and 18 offline tests passed; static interface and actual print-path workspace counterchecks passed. Native rebuilding and deployment remain untested.
+- `v3.1.1-k22b`: documentation consistency update; product code and tests unchanged.
+- `v3.1.0-k22b`: internal only, superseded by v3.1.1-k22b (documentation consistency).
 - `v3.0.0-k22`: K22 source candidate; source reconstruction and 18 offline real-input tests passed. Native rebuilding and deployment remain untested.
 - `v2.1.1` (8 October 2026): public r3 release; documentation/checksum update, with code and patches unchanged from v2.1.
 - `v2.1` (3 October 2026): r3 source release candidate.
 
 Source byte equality is against the derived cleaned target. The four K22b overlay reversals were executed for this stage; the earlier 56-file K22 reversal journal is pinned and inherited, rather than rerun as part of the K22b build. Supplied standard inputs match both their pinned raw K22 counterparts and, after cleanup, the derived K22 files.
+
+Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.

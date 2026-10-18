@@ -2,7 +2,7 @@
 
 ## Scope
 
-The K22b WSL run passed all 18 methods against the seven-patch series and 80 pins (`Ran 18 tests in 28.470s`, `OK`). Static interface and actual print-path workspace counterchecks passed. The earlier K22 result is retained separately.
+The K22b WSL run passed all 18 methods against the seven-patch series and 80 pins (`Ran 18 tests in 27.895s`, `OK`). Static interface and actual print-path workspace counterchecks passed. The earlier K22 result is retained separately.
 
 This inventory covers `tests/test_real_inputs.py` (12 test methods), `tests/test_runtime_inputs.py` (6 methods), `tests/data/recorded-k22b.json`, the preserved K22 oracle and unchanged historical `tests/data/recorded-r3.json`, and their product entry points.
 
@@ -55,4 +55,6 @@ The K22 oracle contains 93 expected environment entries plus the permitted port 
 
 The seven-patch K22b reconstruction reproduced 10,409 regular files and five symlink targets. Four overlay files reverse to their originals and three accompanying standard originals match K22, extending the prior 56-file proof; three fail-closed controls passed. Runtime pin coverage is 62 sources and 80 files total.
 
-The selected configuration still requires 93 oracle environment entries plus the permitted port setting and 74 command arguments. All 12 selected extension switches have readers in the K22b sources. Workspace allocation uses the chunk-sized default with an unset/zero override; a nonzero inherited value is rejected. The first current-stage run passed the 18 archive/runtime methods and the 93-entry plus port / 74-argument configuration comparison. Separate static interface and actual print-path workspace counterchecks passed. Native compilation, GPU execution and live service paths remain outside these offline tests.
+The selected configuration still requires 93 oracle environment entries plus the permitted port setting and 74 command arguments. All 12 selected extension switches have readers in the K22b sources. Workspace allocation uses the chunk-sized default with an unset/zero override; a nonzero inherited value is rejected. The final product run passed the 18 archive/runtime methods and the 93-entry plus port / 74-argument configuration comparison. Separate static interface and actual print-path workspace counterchecks passed. Native compilation, GPU execution and live service paths remain outside these offline tests.
+
+Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.

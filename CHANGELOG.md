@@ -1,5 +1,11 @@
 # Changelog
 
+## v3.1.1-k22b — documentation consistency
+
+- Resolve conflicting validation wording across the six documents. Product code, tests, source patches and runtime pins remain unchanged.
+- Cite the final 27.895-second test run and the actual interface/workspace evidence scope. Additional verification scripts and evidence logs are internal and are not published.
+- v3.1.0-k22b internal only, superseded by v3.1.1-k22b (documentation consistency).
+
 ## v3.1.0-k22b — source reconstruction candidate
 
 Status: **K22b source reconstruction and 18 offline real-input tests passed**. Static interface and actual print-path workspace counterchecks passed.
@@ -38,3 +44,5 @@ Public r3 release. README wording and checksum updates only; code, patches, conf
 ## v2.1 — 3 October 2026
 
 Initial r3 source release candidate with the compatibility baseline, neutral multi-user layer, portable build/launch tools and real-input regression suites. Historical full-load performance gates remained red.
+
+Verification record for the unchanged product code: the final archive passed 18 tests in 27.895 s (k22b-final-real-tests-v2-tests.log:509,511). The static interface check found 12 selected readers and detected the removed-reader and state-key regression controls (k22b-final-check_k22b_interfaces_v1.py.log:1). The actual print path accepted the default and zero workspace settings and rejected half-chunk, double-chunk and invalid overrides (k22b-final-check_k22b_workspace_v1.py.log:1). These additional verification scripts and evidence logs are internal and are not published. Native rebuilding, GPU inference and live-service operation remain untested; no pass for those paths is implied.
