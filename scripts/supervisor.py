@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Service ownership, memory limits and parser readiness for the live r3 path.
+"""Service ownership, memory limits and parser readiness for the K22 path.
 
 Origin: own portable implementation of the live safety checks. Apache-2.0.
 """
@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 
 GIB=1024**3
+MEMORY_MAX_GIB=480
+START_AVAILABLE_GIB=465
 def module(root,name):
     spec=importlib.util.spec_from_file_location(name,root/'scripts'/f'{name}.py')
     result=importlib.util.module_from_spec(spec);spec.loader.exec_module(result);return result
@@ -54,7 +56,7 @@ def cgroup_owner(env,read=Path.read_text):
     paths=[line.split(':',2)[2] for line in entries if line.startswith('0::')]
     if len(paths)!=1 or not paths[0].endswith('/'+unit):raise ValueError('SERVICE_CGROUP_MISMATCH')
     path=Path('/sys/fs/cgroup')/paths[0].lstrip('/')
-    if int(read(path/'memory.max'))!=360*GIB or int(read(path/'memory.swap.max'))!=0:
+    if int(read(path/'memory.max'))!=MEMORY_MAX_GIB*GIB or int(read(path/'memory.swap.max'))!=0:
         raise ValueError('SERVICE_MEMORY_LIMIT_MISMATCH')
     return path
 
@@ -72,7 +74,7 @@ def preflight(root,env,runner=subprocess.run):
     runner([env['DS41_PYTHON'],str(root/'tools/check-cache-paths.py'),'--resolve'],env=env,check=True,capture_output=True,text=True,timeout=30)
     cache=Path(env['DS41_CACHE_ROOT'])/'flashinfer'
     if not (root/'first-start.at').exists() and cache.exists() and any(cache.iterdir()):raise ValueError('FIRST_START_CACHE_NOT_EMPTY')
-    if fields(Path('/proc/meminfo'))['MemAvailable']*1024<420*GIB:raise ValueError('RAM_BUDGET_UNAVAILABLE')
+    if fields(Path('/proc/meminfo'))['MemAvailable']*1024<START_AVAILABLE_GIB*GIB:raise ValueError('RAM_BUDGET_UNAVAILABLE')
     gpu=runner(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader'],check=True,capture_output=True,text=True,timeout=10)
     if gpu.stdout.strip():raise ValueError('GPU_COMPUTE_BUSY')
     units=runner(['systemctl','list-units','ds41-serving-*','--state=active','--no-legend'],check=True,capture_output=True,text=True,timeout=10)
@@ -102,7 +104,7 @@ def start(env):
         preflight(root,resolved['environment'])
         service_env=dict(resolved['environment'],DS41_UNIT=unit,DS41_RUN_DIR=str(run))
         command=['sudo','-n','systemd-run','--unit='+unit,'--uid='+env['DS41_SERVICE_USER'],'--service-type=exec',
-            '-p','MemoryMax=360G','-p','MemorySwapMax=0','-p','KillMode=control-group','-p','OOMPolicy=stop','-p','TimeoutStopSec=30',
+            '-p','MemoryMax='+str(MEMORY_MAX_GIB)+'G','-p','MemorySwapMax=0','-p','KillMode=control-group','-p','OOMPolicy=stop','-p','TimeoutStopSec=30',
             '-p','ExecStopPost='+shlex.join([env['DS41_PYTHON'],str(root/'scripts/gpu_lock.py'),'release','--run-dir',str(run)]),
             '--working-directory='+str(root)]
         command += ['--setenv='+k+'='+v for k,v in service_env.items()]
@@ -134,7 +136,7 @@ def supervise(env):
         (run/'server.pid').write_text(str(child.pid)+'\n')
         try:
             while child.poll() is None:
-                stats=memory(cg);resource_guard(stats,baseline,360)
+                stats=memory(cg);resource_guard(stats,baseline,MEMORY_MAX_GIB)
                 status('MEM '+json.dumps(stats,separators=(',',':')))
                 if not ready:
                     try:

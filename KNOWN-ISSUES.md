@@ -1,6 +1,6 @@
 # Known issues before public release
 
-Initial repository distribution is private. These review observations remain open:
+These review observations remain open in the K22 source candidate:
 
 - The recorded live configuration omits NCCL_*, PYTORCH_CUDA_ALLOC_CONF, TRANSFORMERS_OFFLINE, PATH and DS41_* settings from its filter. They cannot be compared with that live record; the oracle suite does not establish their presence.
 - DSV41_ENGRAM_MANIFEST can select another manifest while preflight checks the standard manifest location. The override is not yet aligned with that check.
@@ -8,3 +8,5 @@ Initial repository distribution is private. These review observations remain ope
 - standard_start.py, warmup.py and build_manifest.py remain outside the current runtime pin set. The four additional runtime consumers requested for this revision are pinned.
 
 Positive model/Engram/runtime readiness, native rebuild, GPU/server operation, HTTP warmup and supervisor signal/service paths remain untested. No substitute states are used to claim those paths.
+
+K22 retains two historically set A1 GPU-expert B12X flags without source readers. The dense MXFP8 B12X path is separate and active. The checkpoint-source marker is newly visible; exact historical environment-byte equality is not claimed.

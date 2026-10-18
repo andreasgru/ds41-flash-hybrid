@@ -9,12 +9,16 @@ mode=${1:---print-plan}
 [[ "$mode" == --print-plan || "$mode" == --build ]] || { echo BUILD_MODE_INVALID >&2; exit 2; }
 build_dir="$DS41_ROOT/build/native"
 source_dir="$DS41_ROOT/sources/ktransformers/kt-kernel"
-configure=(cmake -S "$source_dir" -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release
-  -DLLAMA_AVX2=ON -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DKTRANSFORMERS_USE_CUDA=ON
+configure=(cmake -S "$source_dir" -B "$build_dir" -G Ninja -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release
+  -DLLAMA_AVX2=ON -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX512=OFF
+  -DLLAMA_AVX512_FANCY_SIMD=OFF -DGGML_CUDA=OFF -DKTRANSFORMERS_USE_CUDA=ON
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
   "-DCMAKE_CUDA_COMPILER=$DS41_CUDA_HOME/bin/nvcc" -DCMAKE_CUDA_ARCHITECTURES=120
   "-DPYTHON_EXECUTABLE=$DS41_PYTHON" "-DCMAKE_PREFIX_PATH=$DS41_ROOT/sysroot/usr"
   "-DCMAKE_CXX_FLAGS=-I$DS41_ROOT/sysroot/usr/include -I$DS41_ROOT/sysroot/usr/include/x86_64-linux-gnu"
-  "-DCMAKE_LIBRARY_PATH=$DS41_ROOT/sysroot/usr/lib/x86_64-linux-gnu")
+  "-DCMAKE_LIBRARY_PATH=$DS41_ROOT/sysroot/usr/lib/x86_64-linux-gnu"
+  "-DCMAKE_BUILD_RPATH=$DS41_ROOT/sysroot/usr/lib/x86_64-linux-gnu"
+  "-DCMAKE_INSTALL_RPATH=$DS41_ROOT/sysroot/usr/lib/x86_64-linux-gnu")
 compile=(cmake --build "$build_dir" --target kt_kernel_ext -j 1)
 adapter=(g++ -std=c++17 -O2 -shared -fPIC -pthread "$DS41_ROOT/tools/engram-adapter/row_store.cpp" -o "$DS41_ROOT/tools/engram-adapter/librow_store.so")
 if [[ "$mode" == --print-plan ]]; then

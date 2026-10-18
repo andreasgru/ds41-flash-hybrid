@@ -1,0 +1,2929 @@
+Origin: K22 source snapshot, neutral extension names and English diagnostics
+Purpose: Reproduce the K22 extension from the pinned r3 source baseline
+License: Apache-2.0; preserve upstream notices
+
+diff -ruN a/python/sglang/kernels/jit/csrc/gemm/per_token_group_quant_8bit_v2_swz.cuh b/python/sglang/kernels/jit/csrc/gemm/per_token_group_quant_8bit_v2_swz.cuh
+--- a/python/sglang/kernels/jit/csrc/gemm/per_token_group_quant_8bit_v2_swz.cuh	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/kernels/jit/csrc/gemm/per_token_group_quant_8bit_v2_swz.cuh	2026-10-18 12:44:34.829342257 +0200
+@@ -0,0 +1,454 @@
++// Swizzled scale output: derived from per_token_group_quant_8bit_v2.cuh.
++// Row-major ue8m0 activation scales are written as e8m0 bytes directly into the
++// 128x4-swizzled scale-factor layout read by FlashInfer mm_mxfp8 (b12x/cutlass on SM120).
++// The quantization math (absmax, ceil-pow2 scale, fp8 conversion) matches the baseline code path;
++// only the scale store differs. A separate namespace and JIT module leave the baseline kernel unchanged.
++//
++// JIT port of the AOT sgl_per_token_group_quant_8bit_v2 (sgl-kernel).
++//
++// Same math as the AOT v2 kernel (256-bit vectorized loads, 8 threads/128-group,
++// PDL, NaiveScheduler + MaskedLayoutScheduler, ue8m0/float scales, fp8/int8
++// output, fused silu+mul) so it is a drop-in replacement; the only changes vs the
++// AOT source are the launcher (tvm::ffi::TensorView + TensorMatcher + the JIT
++// LaunchKernel/PDL helpers) and the FP8 type alias.
++#include <sgl_kernel/tensor.h>  // TensorMatcher, SymbolicSize/Device
++#include <sgl_kernel/utils.h>   // RuntimeCheck, Panic
++
++#include <sgl_kernel/utils.cuh>  // LaunchKernel, fp8_e4m3_t, SGL_DEVICE, device::PDLWaitPrimary/TriggerSecondary
++#include <sgl_kernel/warp.cuh>   // device::warp::reduce_max
++
++#include <tvm/ffi/container/tensor.h>
++
++#include <cstdint>
++#include <cuda_fp8.h>
++#include <type_traits>
++
++namespace sglang {
++namespace ds41_mu_swz {
++
++// FlashInfer v0.6.18 csrc/nv_internal/tensorrt_llm/kernels/quantization_utils.cuh:995 (get_sf_out_offset_128x4)
++SGL_DEVICE int64_t sf_offset_128x4(int m_idx, int k_idx, int num_col_vecs) {
++  const int32_t inner_k = k_idx % 4;
++  const int32_t inner_m = (m_idx % (32 * 4)) / 32;
++  const int32_t outer_m = m_idx % 32;
++  const int32_t k_tile = k_idx / 4;
++  const int32_t num_k_tiles = (num_col_vecs + 4 - 1) / 4;
++  const int32_t m_tile = m_idx / (32 * 4);
++  return static_cast<int64_t>(m_tile) * num_k_tiles * 512 + static_cast<int64_t>(k_tile) * 512 + outer_m * 16 +
++         inner_m * 4 + inner_k;
++}
++
++constexpr float LOCAL_ABSMAX_ABS = 1e-10f;
++constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
++
++template <int THREADS_PER_SUBWARP>
++SGL_DEVICE float GroupReduceMax(float val) {
++  static_assert(
++      (THREADS_PER_SUBWARP & (THREADS_PER_SUBWARP - 1)) == 0 && THREADS_PER_SUBWARP <= 16 && THREADS_PER_SUBWARP >= 1,
++      "THREADS_PER_SUBWARP must be 1, 2, 4, 8, or 16");
++  // Reduce within this thread's contiguous THREADS_PER_SUBWARP-lane subgroup via
++  // the shared warp primitive, but pass an explicit subgroup mask instead of its
++  // default 0xffffffff: the block can be < 32 lanes (subwarps_per_block *
++  // THREADS_PER_SUBWARP, e.g. 1..16), where a full-warp mask names non-existent
++  // lanes and is UB / can hang.
++  constexpr device::warp::mask_t kSub = (device::warp::mask_t{1} << THREADS_PER_SUBWARP) - 1;
++  const device::warp::mask_t mask = kSub << (THREADS_PER_SUBWARP * ((threadIdx.x % 32) / THREADS_PER_SUBWARP));
++  return device::warp::reduce_max<THREADS_PER_SUBWARP>(val, mask);
++}
++
++SGL_DEVICE float silu(const float& val) {
++  // Match the AOT v2 kernel: tanh-based silu on SM100+ (Blackwell), exp-based
++  // elsewhere, so the fused silu+mul output stays bit-identical to the AOT op.
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
++  float half = 0.5f * val;
++  float t = __tanhf(half);
++  return half * (1.0f + t);
++#else
++  return val / (1.0f + __expf(-val));
++#endif
++}
++
++SGL_DEVICE float2 fmul2_rn(float2 a, float2 b) {
++  // Match the AOT v2 kernel: use the __fmul2_rn intrinsic on SM100+.
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
++  return __fmul2_rn(a, b);
++#else
++  float2 result;
++  result.x = a.x * b.x;
++  result.y = a.y * b.y;
++  return result;
++#endif
++}
++
++// Copied from DeepEP.
++SGL_DEVICE float fast_pow2(int x) {
++  uint32_t bits_x = (x + 127) << 23;
++  return __uint_as_float(bits_x);  // type-safe bit cast (no strict-aliasing UB)
++}
++SGL_DEVICE int fast_log2_ceil(float x) {
++  auto bits_x = __float_as_uint(x);  // type-safe bit cast (no strict-aliasing UB)
++  auto exp_x = (bits_x >> 23) & 0xff;
++  auto man_bits = bits_x & ((1 << 23) - 1);
++  return exp_x - 127 + (man_bits != 0);
++}
++
++template <typename T>
++struct DtypeInfo;
++template <>
++struct DtypeInfo<int8_t> {
++  static constexpr float MIN = -128;
++  static constexpr float MAX = 127;
++};
++template <>
++struct DtypeInfo<fp8_e4m3_t> {
++  static constexpr float MIN = -448;
++  static constexpr float MAX = 448;
++};
++
++template <bool ROUND_SCALE, typename dtype_info>
++SGL_DEVICE void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
++  constexpr float MAX_8BIT_INV = 1.0f / dtype_info::MAX;
++  if constexpr (ROUND_SCALE) {
++    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
++    scale = fast_pow2(-exp_scale_inv);
++    scale_inv = fast_pow2(exp_scale_inv);
++  } else {
++    scale_inv = amax * MAX_8BIT_INV;
++    scale = dtype_info::MAX / amax;
++  }
++}
++
++template <bool SCALE_UE8M0, typename OUT_DTYPE_T = std::conditional_t<SCALE_UE8M0, uint8_t, float>>
++SGL_DEVICE OUT_DTYPE_T extract_required_scale_format(float value) {
++  if constexpr (SCALE_UE8M0) {
++    return static_cast<uint8_t>(__float_as_uint(value) >> 23);
++  } else {
++    return value;
++  }
++}
++
++template <bool FUSE_SILU_AND_MUL>
++SGL_DEVICE int compute_input_group_start_offset(
++    int expert_idx,
++    int token_idx,
++    int hidden_dim_group_idx,
++    int hidden_size,
++    int num_tokens_per_expert,
++    int group_size) {
++  return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
++         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
++}
++
++struct NaiveScheduler {
++  static void compute_exec_config(
++      int threads_per_subwarp,
++      int num_local_experts,
++      int hidden_dim_num_groups,
++      int num_groups,
++      int& subwarps_per_block,
++      dim3& grid,
++      dim3& block) {
++    subwarps_per_block = (num_groups % 16 == 0)  ? 16
++                         : (num_groups % 8 == 0) ? 8
++                         : (num_groups % 4 == 0) ? 4
++                         : (num_groups % 2 == 0) ? 2
++                                                 : 1;
++    grid = dim3(num_groups / subwarps_per_block);
++    block = dim3(subwarps_per_block * threads_per_subwarp);
++  }
++
++  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
++  SGL_DEVICE static void execute(
++      const int subwarps_per_block,
++      const int hidden_dim_num_groups,
++      const int32_t* masked_m,
++      const int num_tokens_per_expert,
++      FUNC fn) {
++    constexpr int expert_idx = 0;
++    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
++    const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
++    const int64_t group_id = static_cast<int64_t>(blockIdx.x) * subwarps_per_block + subwarp_id;
++
++    int64_t input_group_start_offset;
++    if constexpr (!FUSE_SILU_AND_MUL) input_group_start_offset = group_id * GROUP_SIZE;
++    const int token_idx = group_id / hidden_dim_num_groups;
++    const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
++    if constexpr (FUSE_SILU_AND_MUL) {
++      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
++      input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
++          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
++    }
++    fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
++  }
++};
++
++struct MaskedLayoutScheduler {
++  static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
++  static constexpr int SUBWARPS_PER_BLOCK = 16;
++
++  static void compute_exec_config(
++      int threads_per_subwarp,
++      int num_local_experts,
++      int hidden_dim_num_groups,
++      int num_groups,
++      int& subwarps_per_block,
++      dim3& grid,
++      dim3& block) {
++    subwarps_per_block = SUBWARPS_PER_BLOCK;
++    host::RuntimeCheck(hidden_dim_num_groups % subwarps_per_block == 0, "hidden_dim_num_groups not divisible by 16");
++    grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
++    block = dim3(subwarps_per_block * threads_per_subwarp);
++  }
++
++  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
++  SGL_DEVICE static void execute(
++      const int subwarps_per_block,
++      const int hidden_dim_num_groups,
++      const int32_t* masked_m,
++      const int num_tokens_per_expert,
++      FUNC fn) {
++    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
++    const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
++    const int expert_idx = blockIdx.z;
++    const int token_idx_start = blockIdx.y;
++    const int64_t hidden_dim_group_idx = static_cast<int64_t>(blockIdx.x) * SUBWARPS_PER_BLOCK + subwarp_id;
++    const int curr_expert_token_num = masked_m[expert_idx];
++    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
++         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
++      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
++      const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
++          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
++      fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
++    }
++  }
++};
++
++template <
++    typename SCHEDULER,
++    int GROUP_SIZE,
++    int THREADS_PER_SUBWARP,
++    typename T,
++    typename DST_DTYPE,
++    bool IS_COLUMN_MAJOR,
++    bool SCALE_UE8M0,
++    bool FUSE_SILU_AND_MUL,
++    bool kUsePDL,
++    bool SWZ128X4,
++    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>>
++__global__ void per_token_group_quant_8bit_v2_swz_kernel(
++    const T* __restrict__ input,
++    DST_DTYPE* __restrict__ output_q,
++    scale_packed_t* __restrict__ output_s,
++    const int32_t* __restrict__ masked_m,
++    const int subwarps_per_block,
++    const int hidden_dim_num_groups,
++    const int scale_expert_stride,
++    const int scale_hidden_stride,
++    const int num_tokens_per_expert) {
++  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
++  using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
++  static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
++  static_assert(!SWZ128X4 || (SCALE_UE8M0 && !IS_COLUMN_MAJOR && !FUSE_SILU_AND_MUL),
++                "SWZ128X4 is only defined for row-major ue8m0 scales without silu");
++
++  device::PDLWaitPrimary<kUsePDL>();
++
++  SCHEDULER::template execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
++      subwarps_per_block,
++      hidden_dim_num_groups,
++      masked_m,
++      num_tokens_per_expert,
++      [&](const int expert_idx,
++          const int token_idx,
++          const int hidden_dim_group_idx,
++          const int lane_id,
++          const int input_group_start_offset) {
++        constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
++        constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
++
++        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
++                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
++
++        int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
++        T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
++        int4 input_secondary_int4[INPUT_PRIMARY_INT4_SIZE];
++        T* input_secondary_vec = reinterpret_cast<T*>(input_secondary_int4);
++
++#pragma unroll
++        for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
++          // Ordinary 128-bit vectorized load (LDG.128); .nc gave no measurable
++          // gain on this streaming read-once kernel, so no inline asm.
++          input_primary_int4[j] =
++              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE)[j];
++        }
++        if constexpr (FUSE_SILU_AND_MUL) {
++          const int secondary_offset = hidden_dim_num_groups * GROUP_SIZE;
++#pragma unroll
++          for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
++            input_secondary_int4[j] = reinterpret_cast<const int4*>(
++                input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset)[j];
++          }
++        }
++
++        constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
++        scale_element_t* scale_output;
++        if constexpr (IS_COLUMN_MAJOR) {
++          constexpr int scale_token_stride = 1;
++          const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
++          const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
++          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
++                         (expert_idx * scale_expert_stride * num_elems_per_pack +
++                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
++                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
++        } else {
++          static_assert(!SCALE_UE8M0 || std::is_same_v<scale_packed_t, float>);
++          scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
++        }
++
++        if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
++          const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
++          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
++              (lane_id < num_elems_per_pack - remainder_num_groups)) {
++            const int shift = 1 + lane_id;
++            *(scale_output + shift) = 0;
++          }
++        }
++
++        float local_absmax = LOCAL_ABSMAX_ABS;
++#pragma unroll
++        for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
++          float val;
++          if constexpr (FUSE_SILU_AND_MUL) {
++            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
++            val = static_cast<float>(val_lowprec);
++            input_primary_vec[j] = val_lowprec;
++          } else {
++            val = static_cast<float>(input_primary_vec[j]);
++          }
++          local_absmax = fmaxf(local_absmax, fabsf(val));
++        }
++
++        local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax);
++
++        float y_scale, y_scale_inv;
++        // When SCALE_UE8M0, always quantize with the rounded (power-of-2) scale
++        // — not with the exact scale followed by post-hoc rounding.
++        // This matches the official DeepSeek-V4 kernel.py act_quant(scale_fmt="ue8m0")
++        // and avoids a scale mismatch between quantization and downstream GEMM dequant,
++        // which otherwise amplifies error ~14x and degrades EAGLE accept rate on Blackwell.
++        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
++        if (lane_id == 0) {
++          if constexpr (SWZ128X4) {
++            // e8m0 byte = exponent field of the power-of-two scale (same as extract_required_scale_format<true>)
++            uint8_t* sf = reinterpret_cast<uint8_t*>(output_s);
++            sf[sf_offset_128x4(token_idx, hidden_dim_group_idx, hidden_dim_num_groups)] =
++                static_cast<uint8_t>(__float_as_uint(y_scale_inv) >> 23);
++            // the last real row also zeroes the padding rows below it (up to the next multiple of 128)
++            if (token_idx == num_tokens_per_expert - 1) {
++              const int rows_padded = ((num_tokens_per_expert + 127) / 128) * 128;
++              for (int r = num_tokens_per_expert; r < rows_padded; ++r) {
++                sf[sf_offset_128x4(r, hidden_dim_group_idx, hidden_dim_num_groups)] = 0;
++                if (hidden_dim_group_idx == hidden_dim_num_groups - 1) {
++                  for (int c = hidden_dim_num_groups; c < ((hidden_dim_num_groups + 3) / 4) * 4; ++c) {
++                    sf[sf_offset_128x4(r, c, hidden_dim_num_groups)] = 0;
++                  }
++                }
++              }
++            }
++            // the last group of each row also zeroes the padding columns to the next multiple of 4
++            if (hidden_dim_group_idx == hidden_dim_num_groups - 1) {
++              const int cols_padded = ((hidden_dim_num_groups + 3) / 4) * 4;
++              for (int c = hidden_dim_num_groups; c < cols_padded; ++c) {
++                sf[sf_offset_128x4(token_idx, c, hidden_dim_num_groups)] = 0;
++              }
++            }
++          } else {
++            *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
++          }
++        }
++        float2 y_scale_repeated = {y_scale, y_scale};
++
++        int4 output_buf;
++        if constexpr (std::is_same_v<DST_DTYPE, fp8_e4m3_t>) {
++          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
++#pragma unroll
++          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
++            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
++            float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
++            outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
++            outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
++            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
++          }
++        } else {
++          const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
++#pragma unroll
++          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
++            float val = static_cast<float>(input_primary_vec[j]);
++            float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
++            output_buf_ptr[j] = DST_DTYPE(q_val);
++          }
++        }
++
++        // Ordinary 128-bit vectorized store (STG.128); no inline asm.
++        *reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE) =
++            output_buf;
++      });
++
++  device::PDLTriggerSecondary<kUsePDL>();
++}
++
++// ----------------------------------------------------------------------------
++// Launcher (JIT), swizzled scale output only: row-major input [num_tokens, hidden], group 32, ue8m0, no silu,
++// no masked layout. output_s is a uint8 buffer of round_up(num_tokens,128) * round_up(hidden/32,4) bytes.
++// ----------------------------------------------------------------------------
++template <typename T, typename DST_DTYPE, bool kUsePDL>
++struct PerTokenGroupQuant8bitV2SwzKernel {
++  static void
++  run(tvm::ffi::TensorView input,
++      tvm::ffi::TensorView output_q,
++      tvm::ffi::TensorView output_s,
++      int64_t group_size,
++      int64_t num_groups,
++      int64_t hidden_dim_num_groups,
++      int64_t num_tokens) {
++    if (group_size != 32) {
++      host::Panic("swizzled quantization: group_size must be 32, got ", group_size);
++    }
++    if (num_groups != num_tokens * hidden_dim_num_groups) {
++      host::Panic("swizzled quantization: num_groups mismatch");
++    }
++    constexpr int GS = 32;
++    constexpr int TPS = GS / 16;
++    static_assert((GS / 16) * INPUT_PRIMARY_VEC_NUM_BYTES == GS * static_cast<int>(sizeof(T)));
++    int subwarps_per_block;
++    dim3 grid, block;
++    NaiveScheduler::compute_exec_config(
++        TPS, 1, static_cast<int>(hidden_dim_num_groups), static_cast<int>(num_groups), subwarps_per_block, grid, block);
++    auto kernel = per_token_group_quant_8bit_v2_swz_kernel<
++        NaiveScheduler,
++        GS,
++        TPS,
++        T,
++        DST_DTYPE,
++        /*IS_COLUMN_MAJOR=*/false,
++        /*SCALE_UE8M0=*/true,
++        /*FUSE_SILU_AND_MUL=*/false,
++        kUsePDL,
++        /*SWZ128X4=*/true>;
++    host::LaunchKernel(grid, block, input.device())
++        .enable_pdl(kUsePDL)(
++            kernel,
++            static_cast<const T*>(input.data_ptr()),
++            static_cast<DST_DTYPE*>(output_q.data_ptr()),
++            static_cast<float*>(output_s.data_ptr()),
++            static_cast<const int32_t*>(nullptr),
++            subwarps_per_block,
++            static_cast<int>(hidden_dim_num_groups),
++            0,
++            0,
++            static_cast<int>(num_tokens));
++  }
++};
++
++}  // swizzled quantization namespace
++}  // namespace sglang
+diff -ruN a/python/sglang/kernels/ops/quantization/per_token_group_quant_8bit_v2_swz.py b/python/sglang/kernels/ops/quantization/per_token_group_quant_8bit_v2_swz.py
+--- a/python/sglang/kernels/ops/quantization/per_token_group_quant_8bit_v2_swz.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/kernels/ops/quantization/per_token_group_quant_8bit_v2_swz.py	2026-10-18 12:44:34.830186434 +0200
+@@ -0,0 +1,63 @@
++"""Per-token-group (32, ue8m0) FP8 quantizer with the activation scales written
++directly as e8m0 bytes into the 128x4-swizzled layout of FlashInfer ``mm_mxfp8``.
++
++Separate JIT module (``gemm/per_token_group_quant_8bit_v2_swz.cuh``, a copy of the original kernel with one
++extra scale-store flavour), so the original ``per_token_group_quant_8bit_v2`` used by every other path is
++untouched. The FP8 bytes are produced by the original quantization code path; tests compare them with
++``sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)`` byte for byte.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Tuple
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit, make_cpp_args
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++GROUP = 32
++
++
++@cache_once
++def _jit_module(in_dtype: torch.dtype, out_dtype: torch.dtype, use_pdl: bool) -> Module:
++    args = make_cpp_args(in_dtype, out_dtype, use_pdl)
++    return load_jit(
++        "per_token_group_quant_8bit_v2_swz",
++        *args,
++        cuda_files=["gemm/per_token_group_quant_8bit_v2_swz.cuh"],
++        cuda_wrappers=[
++            (
++                "per_token_group_quant_8bit_v2_swz",
++                f"ds41_mu_swz::PerTokenGroupQuant8bitV2SwzKernel<{args}>::run",
++            )
++        ],
++        # identical flags to the original module, so the quantization math compiles the same way
++        extra_cuda_cflags=["--use_fast_math"],
++    )
++
++
++def swz_scale_numel(m: int, k: int) -> int:
++    """Bytes of the 128x4-swizzled e8m0 scale buffer for an [m, k] activation (group 32)."""
++    if k % GROUP:
++        raise ValueError(f"K={k} must be a multiple of {GROUP}")
++    return ((m + 127) // 128) * 128 * ((k // GROUP + 3) // 4) * 4
++
++
++def per_token_group_quant_fp8_swz128x4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++    """x: [M, K] bf16, contiguous, K % 32 == 0 -> (q [M, K] float8_e4m3fn, sf uint8 [swz_scale_numel])."""
++    if x.dim() != 2 or not x.is_contiguous():
++        raise ValueError("x must be a contiguous 2D tensor")
++    if x.dtype != torch.bfloat16:
++        raise ValueError(f"x must be bfloat16, got {x.dtype}")
++    m, k = x.shape
++    if k % GROUP:
++        raise ValueError(f"K={k} must be a multiple of {GROUP}")
++    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
++    sf = torch.empty((swz_scale_numel(m, k),), dtype=torch.uint8, device=x.device)
++    if m > 0:
++        module = _jit_module(x.dtype, q.dtype, is_arch_support_pdl())
++        module.per_token_group_quant_8bit_v2_swz(x, q, sf, GROUP, m * (k // GROUP), k // GROUP, m)
++    return q, sf
+diff -ruN a/python/sglang/srt/layers/moe/a1_cache.py b/python/sglang/srt/layers/moe/a1_cache.py
+--- a/python/sglang/srt/layers/moe/a1_cache.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/a1_cache.py	2026-10-18 12:44:34.835324539 +0200
+@@ -0,0 +1,231 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Dynamic GPU expert cache for the KT EP wrapper.
++
++Switch ``SGLANG_DS41_MU_A1_CACHE=1`` (default off: kt_ep_wrapper.py then runs its old code and never imports this
++module). With the switch on, two tables replace the constant split "physical id < num_gpu_experts runs on the GPU":
++
++* ``phys2slot`` (device, int64, one per layer): physical expert id -> GPU slot, or -1 for a CPU expert. The GPU
++  path gathers the slot ids from it instead of masking ids >= num_gpu_experts.
++* the KT mask (pinned host bool tensor owned by kt-kernel, read live by the C++ kernels and the completion doorbell):
++  True = the expert runs on the GPU, so the CPU skips it.
++
++kt-kernel skips masked experts when it loads (TP_MOE<AVX2_MXFP4_MOE_TP>::load_weights and build_e8m0), so an
++expert that starts on the GPU would have no CPU weights once it is evicted. With the switch on, KT therefore loads
++with an empty mask (every expert gets its CPU copy) and the start mask is copied into KT's mask afterwards.
++
++Budget 0 without ``SGLANG_DS41_MU_A1_SWAP``: both tables keep their start value (GPU slot s = physical id s for
++s < num_gpu_experts), which is exactly the old split, so the outputs must stay bit-identical.
++``SGLANG_DS41_MU_A1_SWAP=1`` adds the step hook and the swap machinery of a1_exec.py; a budget > 0 is only
++accepted together with it. Budget 0 with the switch runs the swap machinery without a single swap (bit-identical too).
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++from dataclasses import dataclass
++from typing import Mapping, Optional, Tuple
++
++import torch
++
++try:  # inside the fork tree
++    from sglang.srt.layers.moe.a1_policy import PolicyConfig
++except ImportError:  # the offline tests load the file directly: make the sibling importable first
++    import os as _os
++    import sys as _sys
++
++    _here = _os.path.dirname(_os.path.abspath(__file__))
++    if _here not in _sys.path:
++        _sys.path.insert(0, _here)
++    from a1_policy import PolicyConfig  # type: ignore
++
++logger = logging.getLogger(__name__)
++
++ENV_SWITCH = "SGLANG_DS41_MU_A1_CACHE"
++ENV_BUDGET = "SGLANG_DS41_MU_A1_BUDGET"
++ENV_SWAP = "SGLANG_DS41_MU_A1_SWAP"
++ENV_HYSTERESE = "SGLANG_DS41_MU_A1_HYSTERESIS"
++ENV_MIN_RESIDENZ = "SGLANG_DS41_MU_A1_MIN_RESIDENCY"
++ENV_RING = "SGLANG_DS41_MU_A1_RING"
++ENV_STAGER = "SGLANG_DS41_MU_A1_STAGER"
++BUDGETS = ("0", "1", "2", "4")
++_DECIMAL_RX = re.compile(r"[0-9]+(?:\.[0-9]+)?")
++_WHOLE_RX = re.compile(r"[0-9]+")
++RING_DEFAULT = 8       # staging entries = copies in flight at the same time; configurable up to 32
++STAGER_DEFAULT = 1     # stager threads; configurable up to 4
++RING_MIN, RING_MAX = 1, 32
++STAGER_MIN, STAGER_MAX = 1, 4
++HYSTERESE_MIN, HYSTERESE_MAX = 1.0, 10.0
++RESIDENZ_MIN, RESIDENZ_MAX = 0.0, 3600.0
++
++__all__ = [
++    "ENV_SWITCH",
++    "ENV_BUDGET",
++    "ENV_SWAP",
++    "ENV_HYSTERESE",
++    "ENV_MIN_RESIDENZ",
++    "ENV_RING",
++    "ENV_STAGER",
++    "Knobs",
++    "check_env",
++    "knobs",
++    "mask_noop",
++    "start_phys2slot",
++    "start_kt_mask",
++    "kt_load_mask",
++    "apply_start_mask",
++    "check_invariant",
++    "gather_slots_",
++]
++
++
++@dataclass(frozen=True)
++class Knobs:
++    """Runtime settings: hysteresis and minimum residency of the policy, ring size and number of
++    stager threads of the executor. Unset keys keep the defaults below."""
++
++    hysteresis: float = PolicyConfig.hysteresis
++    min_residency_s: float = PolicyConfig.min_residency_s
++    ring: int = RING_DEFAULT
++    stagers: int = STAGER_DEFAULT
++
++
++def _number(env: Mapping[str, str], key: str, default: float, lo: float, hi: float) -> float:
++    """A plain decimal number from the environment (fail-closed): unset or empty -> default; anything that is not
++    exactly digits[.digits] (no sign, no blank, no underscore, no exponent) or lies outside the range raises."""
++    raw = env.get(key)
++    if raw is None or raw.strip() == "":   # a blank value counts as unset, " 32 " below does not
++        return default
++    if not _DECIMAL_RX.fullmatch(raw):
++        raise ValueError(f"A1_ENV: {key}={raw!r} is not a plain decimal number")
++    v = float(raw)
++    if not (lo <= v <= hi):
++        raise ValueError(f"A1_ENV: {key}={raw!r} outside [{lo}, {hi}]")
++    return v
++
++
++def _count(env: Mapping[str, str], key: str, default: int, lo: int, hi: int) -> int:
++    """A whole number from the environment (fail-closed): unset or empty -> default; only digits pass, so a sign, a
++    blank, an underscore or a decimal is rejected instead of being silently accepted by int()."""
++    raw = env.get(key)
++    if raw is None or raw.strip() == "":
++        return default
++    if not _WHOLE_RX.fullmatch(raw):
++        raise ValueError(f"A1_ENV: {key}={raw!r} is not a whole number")
++    v = int(raw, 10)
++    if not (lo <= v <= hi):
++        raise ValueError(f"A1_ENV: {key}={raw!r} outside [{lo}, {hi}]")
++    return v
++
++
++def knobs(environ: Optional[Mapping[str, str]] = None) -> Knobs:
++    """Parse runtime settings (fail-closed): every set key must hold a number inside its range, unset keys keep the
++    default. A typo raises instead of starting with a value nobody meant."""
++    env = os.environ if environ is None else environ
++    k = Knobs(
++        hysteresis=_number(env, ENV_HYSTERESE, PolicyConfig.hysteresis, HYSTERESE_MIN, HYSTERESE_MAX),
++        min_residency_s=_number(env, ENV_MIN_RESIDENZ, PolicyConfig.min_residency_s, RESIDENZ_MIN, RESIDENZ_MAX),
++        ring=_count(env, ENV_RING, RING_DEFAULT, RING_MIN, RING_MAX),
++        stagers=_count(env, ENV_STAGER, STAGER_DEFAULT, STAGER_MIN, STAGER_MAX),
++    )
++    if k.hysteresis < 1.0:  # PolicyConfig.validate repeats this; the message names the environment key
++        raise ValueError(f"A1_ENV: {ENV_HYSTERESE}={k.hysteresis} must be >= 1.0")
++    return k
++
++
++def check_env(environ: Optional[Mapping[str, str]] = None) -> Tuple[int, bool]:
++    """Validate the A1 environment for a switched-on start and return (budget, swap) (fail-closed).
++
++    The switch must be exactly "1"; the budget unset or one of BUDGETS; the swap switch unset, "0" or "1"; a budget
++    > 0 needs swap "1". Anything else raises ValueError, so a typo can never start a half-configured cache."""
++    env = os.environ if environ is None else environ
++    switch = env.get(ENV_SWITCH)
++    if switch != "1":
++        raise ValueError(f"A1_ENV: {ENV_SWITCH} must be '1' when the A1 path is taken, got {switch!r}")
++    budget = env.get(ENV_BUDGET, "0")
++    if budget not in BUDGETS:
++        raise ValueError(f"A1_ENV: {ENV_BUDGET} must be one of {BUDGETS}, got {budget!r}")
++    swap = env.get(ENV_SWAP, "0")
++    if swap not in ("0", "1"):
++        raise ValueError(f"A1_ENV: {ENV_SWAP} must be '0' or '1', got {swap!r}")
++    if budget != "0" and swap != "1":
++        raise ValueError(f"A1_ENV: {ENV_BUDGET}={budget} needs {ENV_SWAP}=1")
++    return int(budget), swap == "1"
++
++
++def mask_noop(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
++    """Stands in for kt_ep_wrapper.mask_cpu_expert_ids under A1: the gather already set every CPU expert to -1 and
++    left every GPU slot id < num_gpu_experts, so the old masking kernel changed nothing."""
++    return topk_ids
++
++
++def start_phys2slot(num_experts: int, num_gpu_experts: int, device=None) -> torch.Tensor:
++    """Start table: physical ids 0..num_gpu_experts-1 sit in GPU slots 0..num_gpu_experts-1, the rest is -1."""
++    if not (isinstance(num_experts, int) and isinstance(num_gpu_experts, int)):
++        raise TypeError("A1: num_experts and num_gpu_experts must be int")
++    if not (0 <= num_gpu_experts <= num_experts) or num_experts <= 0:
++        raise ValueError(f"A1: bad split num_gpu_experts={num_gpu_experts} num_experts={num_experts}")
++    t = torch.full((num_experts,), -1, dtype=torch.int64)
++    t[:num_gpu_experts] = torch.arange(num_gpu_experts, dtype=torch.int64)
++    return t if device is None else t.to(device)
++
++
++def start_kt_mask(num_experts: int, num_gpu_experts: int) -> torch.Tensor:
++    """Start KT mask (CPU bool): True for physical ids 0..num_gpu_experts-1 (the same mask kt_ep_wrapper builds)."""
++    p2s = start_phys2slot(num_experts, num_gpu_experts)
++    return p2s >= 0
++
++
++def kt_load_mask(gpu_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++    """create_weights hook: return (mask KT loads with = all False, start mask = a copy of the old mask)."""
++    if gpu_mask.dtype != torch.bool or gpu_mask.dim() != 1:
++        raise ValueError(f"A1: KT mask must be a 1-D bool tensor, got {gpu_mask.dtype} {tuple(gpu_mask.shape)}")
++    return torch.zeros_like(gpu_mask), gpu_mask.clone()
++
++
++def apply_start_mask(kt_mask: torch.Tensor, start_mask: torch.Tensor, layer_idx: int) -> None:
++    """After KT loaded every expert: copy the start mask into KT's own (shared, pinned) mask in place.
++
++    Fail-closed when KT did not load with the empty mask (some expert would lack its CPU copy), when the shapes or
++    dtypes differ. copy_ writes into the existing buffer, whose address the C++ configuration and completion
++    signaling retain."""
++    if kt_mask.dtype != torch.bool or start_mask.dtype != torch.bool:
++        raise RuntimeError(f"A1_KT_MASK layer {layer_idx}: dtype {kt_mask.dtype}/{start_mask.dtype}, need bool")
++    if kt_mask.shape != start_mask.shape:
++        raise RuntimeError(f"A1_KT_MASK layer {layer_idx}: shape {tuple(kt_mask.shape)} != {tuple(start_mask.shape)}")
++    if bool(kt_mask.any()):
++        raise RuntimeError(
++            f"A1_KT_MASK_NOT_EMPTY layer {layer_idx}: KT loaded with {int(kt_mask.sum())} masked experts, "
++            "so those experts have no CPU weights"
++        )
++    kt_mask.copy_(start_mask)
++
++
++def check_invariant(phys2slot: torch.Tensor, kt_mask: torch.Tensor, num_slots: int) -> None:
++    """Host-side invariant on CPU copies: every physical id is either on the GPU (slot >= 0 and mask True) or on
++    the CPU (slot -1 and mask False); GPU slots are in range and used at most once. Raises RuntimeError."""
++    p = phys2slot.detach().to("cpu", torch.int64)
++    m = kt_mask.detach().to("cpu", torch.bool)
++    if p.dim() != 1 or m.dim() != 1 or p.numel() != m.numel():
++        raise RuntimeError(f"A1_INVARIANT shapes {tuple(p.shape)} / {tuple(m.shape)}")
++    on_gpu = p >= 0
++    if bool((p < -1).any()):
++        raise RuntimeError("A1_INVARIANT: slot ids below -1")
++    if not torch.equal(on_gpu, m):
++        bad = torch.nonzero(on_gpu != m).flatten()[:8].tolist()
++        raise RuntimeError(f"A1_INVARIANT: phys2slot and KT mask disagree for physical ids {bad}")
++    slots = p[on_gpu]
++    if slots.numel() and (int(slots.max()) >= num_slots):
++        raise RuntimeError(f"A1_INVARIANT: slot {int(slots.max())} >= {num_slots} GPU slots")
++    if slots.numel() != torch.unique(slots).numel():
++        raise RuntimeError("A1_INVARIANT: a GPU slot holds more than one expert")
++
++
++def gather_slots_(topk_ids: torch.Tensor, phys2slot: torch.Tensor) -> torch.Tensor:
++    """In place: physical expert id -> GPU slot (or -1 for a CPU expert); negative ids stay as they are.
++
++    Same contract as kt_ep_wrapper.mask_cpu_expert_ids (in place, same dtype and shape), with the table taking the
++    place of the constant split. kt_ep_wrapper compiles it like mask_cpu_expert_ids."""
++    slots = phys2slot[topk_ids.clamp(min=0).long()]
++    topk_ids.copy_(torch.where(topk_ids >= 0, slots, topk_ids.long()))
++    return topk_ids
+diff -ruN a/python/sglang/srt/layers/moe/a1_exec.py b/python/sglang/srt/layers/moe/a1_exec.py
+--- a/python/sglang/srt/layers/moe/a1_exec.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/a1_exec.py	2026-10-18 12:44:34.835617165 +0200
+@@ -0,0 +1,670 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Device executor of the dynamic GPU expert cache.
++
++Active only with SGLANG_DS41_MU_A1_CACHE=1 and SGLANG_DS41_MU_A1_SWAP=1 (a1_cache.check_env). Pieces:
++
++* per-layer device tables with fixed addresses (CUDA graphs read them on every replay; they are only ever written
++  in place): ``phys2slot`` (gather in the wrapper), a device mirror of KT's mask, ``phys2virt`` (stream prefill) and
++  an int32 routing counter (``index_add_`` captured in the decode graphs);
++* ``step_hook(forward_batch)``, called by ModelRunner.forward before every forward on the scheduler's forward
++  stream: reads finished counter snapshots, feeds decode intervals to SwapController (a1_swap.py), writes the table
++  changes stream-ordered (H2D into the tables, D2H from the device mask into KT's pinned mask: KT reads the mask only
++  after the stream's doorbell), records the read-done event of unpublished slots and hands the
++  copy jobs to the stager;
++* the stager (one thread): copy directly from the checkpoint (np.memmap of the safetensors files), GIL-free
++  ctypes.memmove into a pinned ring entry ([up; gate] like the resident w13), H2D on its own stream after the slot's
++  read-done event, scales through a fixed permutation (= flashinfer.block_scale_interleave, derived and checked at
++  start), canary samples read back before the copy-done event;
++* start self-test (fail-closed, A1_SELFTEST_MISMATCH): checkpoint bytes of resident experts equal the resident slots;
++* event trace (jsonl, SGLANG_DS41_MU_A1_TRACE=<path>) and the A1_STAT window line (SGLANG_DS41_MU_A1_STAT_S).
++
++Optional statistics, policy and staging settings; unset keys retain the default behaviour:
++* Window statistics in ``a1_stat.WindowStats``: interval per ``SGLANG_DS41_MU_A1_STAT_S`` (default 60 s), hit rate OF THE
++  WINDOW with the cumulative value next to it, layers without a CPU expert per decode step, backlog/queue/transit;
++* Policy knobs (``SGLANG_DS41_MU_A1_HYSTERESIS``, ``SGLANG_DS41_MU_A1_MIN_RESIDENCY``) go into the policy; the minimum residency
++  is counted from the moment a slot is PUBLISHED (a1_swap marks it), the clock of the hook is handed down;
++* Staging throughput: ``SGLANG_DS41_MU_A1_RING`` staging entries (default 8, supports up to 32), ``SGLANG_DS41_MU_A1_STAGER``
++  stager threads (default 1, supports up to 4) and, per staged part, the page-cache share (mincore) and the duration.
++"""
++from __future__ import annotations
++
++import ctypes
++import json
++import logging
++import os
++import queue
++import re
++import struct
++import threading
++import time
++from pathlib import Path
++from typing import Dict, List, Optional
++
++import numpy as np
++import torch
++
++try:  # inside the fork tree
++    from sglang.srt.layers.moe.a1_cache import check_env, knobs
++    from sglang.srt.layers.moe.a1_policy import PolicyConfig
++    from sglang.srt.layers.moe.a1_stat import WindowStats, resident_pages, stat_interval_s
++    from sglang.srt.layers.moe.a1_swap import SwapController
++except ImportError:  # the offline tests load the file directly (moe directory on sys.path)
++    from a1_cache import check_env, knobs  # type: ignore
++    from a1_policy import PolicyConfig  # type: ignore
++    from a1_stat import WindowStats, resident_pages, stat_interval_s  # type: ignore
++    from a1_swap import SwapController  # type: ignore
++
++logger = logging.getLogger(__name__)
++
++ENV_TRACE = "SGLANG_DS41_MU_A1_TRACE"
++SNAP_RING = 8          # pinned counter snapshots
++DRAIN_TIMEOUT_S = 60.0
++CANARY = 4096          # bytes per sample, 3 samples per region
++
++# checkpoint names of one routed expert: layers.<l>.ffn.experts.<e>.<w1|w2|w3>.<weight|scale>
++_NAME = re.compile(r"^(?:model\.)?layers\.(\d+)\.(?:ffn|mlp)\.experts\.(\d+)\.(w1|w2|w3)\.(weight|scale)$")
++_PART = {("w1", "weight"): "gate_w", ("w3", "weight"): "up_w", ("w2", "weight"): "down_w",
++         ("w1", "scale"): "gate_s", ("w3", "scale"): "up_s", ("w2", "scale"): "down_s"}
++
++_RT: Optional["A1Runtime"] = None
++
++
++def runtime() -> "A1Runtime":
++    global _RT
++    if _RT is None:
++        _RT = A1Runtime()
++    return _RT
++
++
++def route_count_(topk_ids: torch.Tensor, counts: torch.Tensor, one: torch.Tensor) -> None:
++    """Decode-graph routing counter (captured): counts[physical id] += 1 per routed entry; negative ids (no expert)
++    add nothing. ``one`` (shape (1,), dtype of ``counts``) carries the dtype; counts wrap like int32."""
++    ids = topk_ids.reshape(-1)
++    counts.index_add_(0, ids.clamp(min=0).to(torch.int64), (ids >= 0).to(one.dtype))
++
++
++def counts_delta(now: np.ndarray, prev: np.ndarray) -> np.ndarray:
++    """Per-interval counts from two cumulative int32 snapshots (int64 arrays of the int32 values): the counters wrap
++    at 2**32, an interval never holds 2**31 or more routings of one expert."""
++    d = (now.astype(np.int64) - prev.astype(np.int64)) & 0xFFFFFFFF
++    return d
++
++
++def scatter_tables_(p2s: torch.Tensor, mask: torch.Tensor, ups: torch.Tensor) -> None:
++    """In place on the [layers, experts] tables: rows (layer_idx, phys, slot) set phys2slot[layer_idx, phys] = slot
++    and mask = slot >= 0 (slot -1 = unpublish). Same device for all three; addresses never change."""
++    if ups.dim() != 2 or ups.shape[1] != 3 or ups.dtype != torch.int64:
++        raise RuntimeError(f"A1_EXEC: bad update rows {tuple(ups.shape)} {ups.dtype}")
++    E = p2s.shape[1]
++    flat = ups[:, 0] * E + ups[:, 1]
++    p2s.view(-1).index_copy_(0, flat, ups[:, 2])
++    mask.view(-1).index_copy_(0, flat, ups[:, 2] >= 0)
++
++
++def plan_updates(plan, order) -> list:
++    """Table rows (layer_idx, phys, slot) of one hook plan: unpublish rows carry slot -1. A (layer, phys) pair occurs
++    at most once (index_copy_ with repeated indices is undefined on the GPU), checked here on the host."""
++    ups = [(order[li], p, -1) for li, p, _s in plan.unpublish] + [(order[li], p, s) for li, p, s in plan.publish]
++    if len({(a, b) for a, b, _ in ups}) != len(ups):
++        raise RuntimeError(f"A1_EXEC: hook {plan.hook} changes one expert twice: {ups[:8]}")
++    return ups
++
++
++def virtual_ids(physical_ids: torch.Tensor, p2v_row: torch.Tensor) -> torch.Tensor:
++    """Stream prefill: physical ids -> virtual CPU ids n..E-1 (GPU experts -1, negative ids kept), same dtype; a new
++    tensor."""
++    return torch.where(physical_ids >= 0, p2v_row[physical_ids.clamp(min=0).long()],
++                       physical_ids.long()).to(physical_ids.dtype)
++
++
++def ring_layout(N: int, K: int):
++    """Byte layout of one staging entry: [up_w; gate_w] (= w13 rows of the slot), down_w, [up_s; gate_s], down_s."""
++    off, o = {}, 0
++    for part, nb in (("up_w", N * K // 2), ("gate_w", N * K // 2), ("down_w", K * N // 2),
++                     ("up_s", N * K // 32), ("gate_s", N * K // 32), ("down_s", K * N // 32)):
++        off[part] = (o, nb)
++        o += nb
++    return off, o
++
++
++def canary_offsets(n: int):
++    """Three CANARY-byte samples of a region of n bytes: start, 64-aligned middle (never past n - CANARY), end."""
++    if n < CANARY:
++        raise RuntimeError(f"A1_EXEC: region of {n} bytes < canary {CANARY}")
++    return (0, min((n // 2) & ~63, n - CANARY), n - CANARY)
++
++
++def copy_slot_(dsts, host: torch.Tensor, off: dict, perm: dict, land13: torch.Tensor, land2: torch.Tensor,
++               canary: torch.Tensor) -> None:
++    """The copy of one staged expert into a slot (dsts = w13, w2, w13 scales, w2 scales as flat uint8 views), on
++    the current stream: weights direct, scales through the landing pads and the interleave permutation, then the
++    canary samples of all four destinations into ``canary`` (read back before the copy counts as done)."""
++    w13, w2, s13, s2 = dsts
++    o_w13, n_w13 = off["up_w"][0], 2 * off["up_w"][1]
++    o_w2, n_w2 = off["down_w"]
++    o_s13, n_s13 = off["up_s"][0], 2 * off["up_s"][1]
++    o_s2, n_s2 = off["down_s"]
++    w13.copy_(host[o_w13:o_w13 + n_w13], non_blocking=True)
++    w2.copy_(host[o_w2:o_w2 + n_w2], non_blocking=True)
++    land13.copy_(host[o_s13:o_s13 + n_s13], non_blocking=True)
++    land2.copy_(host[o_s2:o_s2 + n_s2], non_blocking=True)
++    torch.index_select(land13, 0, perm["w13"], out=s13)
++    torch.index_select(land2, 0, perm["w2"], out=s2)
++    k = 0
++    for dst in (w13, w2, s13, s2):
++        for a in canary_offsets(dst.numel()):
++            canary[k:k + CANARY].copy_(dst[a:a + CANARY], non_blocking=True)
++            k += CANARY
++
++
++def canary_expected(host: np.ndarray, off: dict, perm_host: dict) -> np.ndarray:
++    """What copy_slot_ must read back for a staged entry (host bytes): weight samples as staged, scale samples
++    through the permutation."""
++    o_w13, n_w13 = off["up_w"][0], 2 * off["up_w"][1]
++    o_w2, n_w2 = off["down_w"]
++    o_s13, n_s13 = off["up_s"][0], 2 * off["up_s"][1]
++    o_s2, n_s2 = off["down_s"]
++    want = []
++    for o, n in ((o_w13, n_w13), (o_w2, n_w2)):
++        for a in canary_offsets(n):
++            want.append(host[o + a:o + a + CANARY])
++    for o, n, name in ((o_s13, n_s13, "w13"), (o_s2, n_s2, "w2")):
++        src = host[o:o + n]
++        for a in canary_offsets(n):
++            want.append(src[perm_host[name][a:a + CANARY]])
++    return np.concatenate(want)
++
++
++def step_hook(forward_batch) -> None:
++    """ModelRunner.forward entry (A1 swap on). Every error raises: fatal for the run, no numbers (fail-closed)."""
++    rt = _RT
++    if rt is None or not rt.layers:
++        return
++    rt.hook(forward_batch)
++
++
++# ---------------------------------------------------------------------------------------------- checkpoint bytes
++class CheckpointExperts:
++    """Byte ranges of every routed expert in the safetensors checkpoint, served from np.memmap (page cache)."""
++
++    def __init__(self, model_dir: str, N: int, K: int):
++        root = Path(model_dir)
++        index = root / "model.safetensors.index.json"
++        if index.is_file():
++            wmap = json.loads(index.read_text())["weight_map"]
++            files = sorted(set(wmap.values()))
++        else:
++            files = sorted(p.name for p in root.glob("*.safetensors"))
++        if not files:
++            raise RuntimeError(f"A1_CKPT: no safetensors files under {root}")
++        self.sizes = {"gate_w": N * K // 2, "up_w": N * K // 2, "down_w": K * N // 2,
++                      "gate_s": N * K // 32, "up_s": N * K // 32, "down_s": K * N // 32}
++        self.page_size = int(os.sysconf("SC_PAGE_SIZE"))
++        self.maps: Dict[str, np.memmap] = {}
++        self.parts: Dict[tuple, Dict[str, tuple]] = {}
++        for f in files:
++            path = root / f
++            with open(path, "rb") as fh:
++                n = struct.unpack("<Q", fh.read(8))[0]
++                hdr = json.loads(fh.read(n))
++            mm = None
++            for name, meta in hdr.items():
++                m = _NAME.match(name)
++                if m is None:
++                    continue
++                part = _PART[(m.group(3), m.group(4))]
++                a, b = meta["data_offsets"]
++                if b - a != self.sizes[part]:
++                    raise RuntimeError(f"A1_CKPT: {name} has {b - a} bytes, expected {self.sizes[part]}")
++                if mm is None:
++                    mm = self.maps.setdefault(f, np.memmap(path, dtype=np.uint8, mode="r"))
++                key = (int(m.group(1)), int(m.group(2)))
++                if part in self.parts.setdefault(key, {}):
++                    raise RuntimeError(f"A1_CKPT: {name} twice")
++                self.parts[key][part] = (f, 8 + n + a, b - a)
++        for key, d in self.parts.items():
++            if len(d) != 6:
++                raise RuntimeError(f"A1_CKPT: layer {key[0]} expert {key[1]} has parts {sorted(d)}")
++        if not self.parts:
++            raise RuntimeError("A1_CKPT: no routed expert tensors found (name pattern)")
++
++    def addr(self, layer: int, expert: int, part: str):
++        try:
++            f, off, nbytes = self.parts[(layer, expert)][part]
++        except KeyError:
++            raise RuntimeError(f"A1_CKPT: no {part} for layer {layer} expert {expert}") from None
++        return self.maps[f].ctypes.data + off, nbytes
++
++    def resident_share(self, layer: int, expert: int, part: str) -> float:
++        """Share of the part's pages that sat in the page cache before the copy (mincore on the mapping): 1.0 =
++        the whole part comes from the page cache, 0.0 = every page has to be read from the device."""
++        addr, nbytes = self.addr(layer, expert, part)
++        resident, total = resident_pages(addr, nbytes, self.page_size)
++        return resident / total
++
++
++# ---------------------------------------------------------------------------------------------- runtime
++class _Job:
++    __slots__ = ("job", "ev_read", "entry", "copy_done", "enqueued", "error", "t_issue", "t_staged", "parts")
++
++    def __init__(self, job, ev_read):
++        self.job, self.ev_read = job, ev_read
++        self.entry = None
++        self.copy_done = None
++        self.enqueued = threading.Event()
++        self.error: Optional[BaseException] = None
++        self.t_issue = time.perf_counter()
++        self.t_staged = 0.0
++        self.parts = ()  # (part, page-cache share, ms) of every staged part, fed to the window statistics
++
++
++class A1Runtime:
++    def __init__(self):
++        budget, swap = check_env()
++        if not swap:
++            raise RuntimeError("A1_EXEC: the runtime needs SGLANG_DS41_MU_A1_SWAP=1")
++        self.knobs = knobs()
++        self.budget = budget
++        self.layers: Dict[int, tuple] = {}     # layer_idx -> (method, layer module)
++        self.tables = None
++        self.ctl: Optional[SwapController] = None
++        self.ready = False
++        self.trace = None
++        self._jobs: Dict[int, _Job] = {}
++        self._slot_ev: Dict[tuple, torch.cuda.Event] = {}
++        self._snaps: List[tuple] = []            # (hook, mode_decode, event, buf idx)
++        self._snap_prev: Optional[np.ndarray] = None
++        self._snap_prev_meta = (-1, False)
++        self._virt_dirty: set = set()
++        self._snap_i = 0
++        self._last_hook = -1
++        self._last_decode = False
++        self._stat = {"drains": 0}
++        self.stat = self._new_stat(time.monotonic())
++        self._q: "queue.Queue" = queue.Queue()
++        self._free: "queue.Queue" = queue.Queue()
++        self._threads: List[threading.Thread] = []
++        self._fatal: Optional[BaseException] = None
++
++    def _new_stat(self, now: float) -> WindowStats:
++        """Window statistics with the interval from SGLANG_DS41_MU_A1_STAT_S (default 60 s).
++        Tags record the policy settings used for this run."""
++        k = self.knobs
++        return WindowStats(stat_interval_s(), now, tags={"ring": k.ring, "stagers": k.stagers, "budget": self.budget,
++                                                         "hyst": k.hysteresis, "resid": k.min_residency_s})
++
++    # ------------------------------------------------------------------ tables (wrapper, before graph capture)
++    def alloc_layer(self, method) -> None:
++        """create_weights/process_weights time: device rows for this layer (views into [layers, experts] tensors
++        with fixed addresses; a second call for the same layer is refused: A1_RELOAD_UNSUPPORTED)."""
++        L = int(method.kt_config.num_layers or 0)
++        E = int(method.global_num_experts)
++        n = int(method.num_gpu_experts)
++        li = int(method.kt_config.layer_idx)
++        if L <= li:
++            raise RuntimeError(f"A1_EXEC: num_layers {L} <= layer_idx {li}")
++        if self.tables is None:
++            dev = torch.device("cuda", torch.cuda.current_device())
++            p2s = torch.full((L, E), -1, dtype=torch.int64, device=dev)
++            p2s[:, :n] = torch.arange(n, dtype=torch.int64, device=dev)
++            p2v = torch.full((L, E), -1, dtype=torch.int64, device=dev)
++            p2v[:, n:] = torch.arange(n, E, dtype=torch.int64, device=dev)
++            self.tables = {
++                "L": L, "E": E, "n": n, "dev": dev,
++                "p2s": p2s, "p2v": p2v,
++                "mask": p2s >= 0,
++                "counts": torch.zeros((L, E), dtype=torch.int32, device=dev),
++                "one": torch.ones((1,), dtype=torch.int32, device=dev),
++                "rows": set(),
++                "snap": [torch.zeros((L, E), dtype=torch.int32).pin_memory() for _ in range(SNAP_RING)],
++            }
++        t = self.tables
++        if (L, E, n) != (t["L"], t["E"], t["n"]):
++            raise RuntimeError(f"A1_EXEC: layer {li} shape {(L, E, n)} != {(t['L'], t['E'], t['n'])}")
++        if li in t["rows"]:
++            raise RuntimeError(f"A1_RELOAD_UNSUPPORTED: layer {li} allocated twice (weights reloaded under A1)")
++        t["rows"].add(li)
++        method._a1_phys2slot = t["p2s"][li]
++        method._a1_counts = t["counts"][li]
++        method._a1_one = t["one"]
++
++    def register_layer(self, method, layer) -> None:
++        """After KT loaded every expert and the start mask is in place (process_weights_after_loading)."""
++        li = int(method.kt_config.layer_idx)
++        if li in self.layers:
++            raise RuntimeError(f"A1_RELOAD_UNSUPPORTED: layer {li} registered twice")
++        self.layers[li] = (method, layer)
++
++    def to_virtual(self, physical_ids: torch.Tensor, layer_idx: int) -> torch.Tensor:
++        """Stream prefill: physical ids -> virtual CPU ids (GPU experts -1), same dtype; the step was drained."""
++        if self.ctl is not None and int((self.ctl.slot_pub[self._li[layer_idx]] < 0).sum()):
++            raise RuntimeError(f"A1_VIRT_TRANSIT layer {layer_idx}: stream prefill with slots in transit")
++        if self.ctl is not None and self._li[layer_idx] in self._virt_dirty:
++            raise RuntimeError(f"A1_VIRT_STALE layer {layer_idx}: phys2virt not refreshed after a change")
++        return virtual_ids(physical_ids, self.tables["p2v"][layer_idx])
++
++    def virt_to_phys(self, method, experts: List[int]) -> List[int]:
++        """kt_stream_prefill writer: virtual CPU ids of a group -> physical ids of this layer."""
++        if self.ctl is None:
++            return experts
++        li = self._li[int(method.kt_config.layer_idx)]
++        v2p = self._v2p[li]
++        n = self.tables["n"]
++        return [int(v2p[v - n]) for v in experts]
++
++    # ------------------------------------------------------------------ start
++    def _start(self) -> None:
++        t = self.tables
++        order = sorted(self.layers)
++        if not order or set(order) != t["rows"]:
++            raise RuntimeError(f"A1_EXEC: registered layers {order} != allocated rows {sorted(t['rows'])}")
++        from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
++
++        p2l_all = get_global_expert_location_metadata().physical_to_logical_map_cpu
++        p2l = np.stack([np.asarray(p2l_all[li].numpy(), dtype=np.int64) for li in order])
++        self._order = order
++        self._li = {li: i for i, li in enumerate(order)}
++        k = self.knobs
++        self.ctl = SwapController(p2l, t["n"], PolicyConfig(budget=float(self.budget), hysteresis=k.hysteresis,
++                                                            min_residency_s=k.min_residency_s),
++                                  max_inflight=k.ring, history=1024)
++        self._v2p = [self.ctl.virt_row(i)[1] for i in range(len(order))]
++        m0, layer0 = self.layers[order[0]]
++        self.N = int(layer0.intermediate_size_per_partition)
++        self.K = int(layer0.hidden_size)
++        self.ckpt = CheckpointExperts(m0.kt_config.weight_path, self.N, self.K)
++        self.copy_stream = torch.cuda.Stream(device=t["dev"], priority=0)
++        self._make_perms()
++        self._make_ring()
++        self._selftest()
++        for i in range(k.stagers):
++            thread = threading.Thread(target=self._stager_loop, name=f"a1-stager-{i}", daemon=True)
++            self._threads.append(thread)
++            thread.start()
++        path = os.environ.get(ENV_TRACE)
++        if path:
++            self.trace = open(path, "x", buffering=1 << 20)
++        self.ready = True
++        logger.info("A1_P2_READY layers=%d slots=%d budget=%s ring=%d stagers=%d hyst=%s resid=%s ckpt_experts=%d",
++                    len(order), t["n"], self.budget, k.ring, k.stagers, k.hysteresis, k.min_residency_s,
++                    len(self.ckpt.parts))
++
++    def _make_perms(self) -> None:
++        """Byte permutation of flashinfer.block_scale_interleave for one expert's w13 and w2 scale matrix, derived
++        from three byte planes of an index tensor (the interleave moves bytes, it does not change them)."""
++        from flashinfer import block_scale_interleave
++
++        N, K, dev = self.N, self.K, self.tables["dev"]
++        self.perm = {}
++        for name, shape in (("w13", (1, 2 * N, K // 32)), ("w2", (1, K, N // 32))):
++            cnt = int(np.prod(shape))
++            idx = torch.arange(cnt, dtype=torch.int64, device=dev)
++            planes = []
++            for b in range(3):
++                pl = ((idx >> (8 * b)) & 0xFF).to(torch.uint8).view(shape)
++                planes.append(block_scale_interleave(pl).reshape(-1).to(torch.int64))
++            perm = planes[0] | (planes[1] << 8) | (planes[2] << 16)
++            if not torch.equal(torch.sort(perm).values, idx):
++                raise RuntimeError(f"A1_SELFTEST_MISMATCH: interleave of {name} scales is not a permutation")
++            self.perm[name] = perm
++        self.perm_host = {k: v.cpu().numpy() for k, v in self.perm.items()}
++
++    def _make_ring(self) -> None:
++        N, K, dev = self.N, self.K, self.tables["dev"]
++        self.off, o = ring_layout(N, K)
++        self.entry_bytes = o
++        self.ring = []
++        for i in range(self.knobs.ring):
++            self.ring.append({
++                "host": torch.empty(o, dtype=torch.uint8).pin_memory(),
++                "land13": torch.empty(2 * N * K // 32, dtype=torch.uint8, device=dev),
++                "land2": torch.empty(K * N // 32, dtype=torch.uint8, device=dev),
++                "canary": torch.empty(4 * 3 * CANARY, dtype=torch.uint8).pin_memory(),
++                "i": i,
++            })
++            self._free.put(i)
++
++    def _stage_host(self, e: dict, layer_idx: int, logical: int) -> None:
++        """Copy the six byte ranges of one expert out of the checkpoint into the staging entry (GIL released during
++        memmove) and note per part how much of it sat in the page cache and how long the copy took."""
++        base = e["host"].data_ptr()
++        parts = []
++        for part, (o, nb) in self.off.items():
++            src, n = self.ckpt.addr(layer_idx, logical, part)
++            if n != nb:
++                raise RuntimeError(f"A1_CKPT: {part} {n} bytes != {nb}")
++            share = self.ckpt.resident_share(layer_idx, logical, part)   # before the copy: cache or device
++            t0 = time.perf_counter()
++            ctypes.memmove(base + o, src, nb)  # GIL released; page cache or NVMe
++            parts.append((part, share, (time.perf_counter() - t0) * 1e3))
++        e["parts"] = tuple(parts)
++
++    def _dst(self, layer_idx: int, slot: int):
++        _, layer = self.layers[layer_idx]
++        return (layer.w13_weight.data[slot].view(torch.uint8).view(-1),
++                layer.w2_weight.data[slot].view(torch.uint8).view(-1),
++                layer.w13_weight_scale_inv.data[slot].view(torch.uint8).view(-1),
++                layer.w2_weight_scale_inv.data[slot].view(torch.uint8).view(-1))
++
++    def _enqueue_copy(self, e: dict, layer_idx: int, slot: int, ev_read) -> torch.cuda.Event:
++        """On the copy stream: wait read-done, H2D weights into the slot, scales via the landing pad + permutation,
++        canary samples D2H; returns the copy-done event."""
++        cs = self.copy_stream
++        with torch.cuda.stream(cs):
++            cs.wait_event(ev_read)
++            copy_slot_(self._dst(layer_idx, slot), e["host"], self.off, self.perm, e["land13"], e["land2"],
++                       e["canary"])
++            done = torch.cuda.Event()
++            done.record(cs)
++        return done
++
++    def _canary_ok(self, e: dict) -> bool:
++        return np.array_equal(canary_expected(e["host"].numpy(), self.off, self.perm_host), e["canary"].numpy())
++
++    def _selftest(self) -> None:
++        """Checkpoint bytes of three resident experts (first, middle, last KT layer; slots 0, n/2, n-1) through the real copy path
++        into a scratch landing slot must equal the resident slot bytes. Fail-closed."""
++        t = self.tables
++        e = self.ring[0]
++        n = t["n"]
++        bad = []
++        for li, s in ((self._order[0], 0), (self._order[len(self._order) // 2], n // 2), (self._order[-1], n - 1)):
++            logical = int(self.ctl.p2l[self._li[li], s])
++            self._stage_host(e, li, logical)
++            res = [x.clone() for x in self._dst(li, s)]
++            # land into a scratch copy of the slot, never into the live slot
++            scratch = [torch.empty_like(x) for x in res]
++            with torch.cuda.stream(self.copy_stream):
++                copy_slot_(scratch, e["host"], self.off, self.perm, e["land13"], e["land2"], e["canary"])
++            self.copy_stream.synchronize()
++            if not self._canary_ok(e):
++                bad.append(f"layer {li} slot {s}: canary of the self-test copy differs")
++            for name, a, b in zip(("w13", "w2", "s13", "s2"), scratch, res):
++                if not torch.equal(a, b):
++                    bad.append(f"layer {li} slot {s} expert {logical} {name}: {int((a != b).sum())} bytes differ")
++        if bad:
++            raise RuntimeError("A1_SELFTEST_MISMATCH: " + "; ".join(bad))
++        logger.info("A1_SELFTEST ok: 3 resident experts, checkpoint bytes == resident slots (w13, w2, scales)")
++
++    # ------------------------------------------------------------------ stager threads
++    def _stager_loop(self) -> None:
++        """One stager thread: wait for a copy job, stage its bytes into a free ring entry, hand it to the copy
++        stream. Several threads (SGLANG_DS41_MU_A1_STAGER, 1..4) overlap the host-side reads of different experts."""
++        try:
++            torch.cuda.set_device(self.tables["dev"])
++            while True:
++                jb = self._q.get()
++                if jb is None:
++                    return
++                i = self._free.get()
++                e = self.ring[i]
++                t0 = time.perf_counter()
++                self._stage_host(e, jb.job.layer_idx, jb.job.logical)
++                jb.t_staged = time.perf_counter() - t0
++                jb.parts = e["parts"]
++                jb.entry = i
++                jb.copy_done = self._enqueue_copy(e, jb.job.layer_idx, jb.job.slot, jb.ev_read)
++                jb.enqueued.set()
++        except BaseException as ex:  # surfaced in the next hook (fatal)
++            self._fatal = ex
++            logger.error("A1 stager failed", exc_info=True)
++
++    # ------------------------------------------------------------------ hook
++    def hook(self, forward_batch) -> None:
++        if torch.cuda.is_current_stream_capturing():
++            return
++        if self._fatal is not None:
++            raise RuntimeError("A1_STAGER_FAILED") from self._fatal
++        if not self.ready:
++            self._start()
++        mode = forward_batch.forward_mode
++        decode = bool(mode.is_decode())
++        tokens = int(forward_batch.input_ids.shape[0]) if getattr(forward_batch, "input_ids", None) is not None else 0
++        ctl, t = self.ctl, self.tables
++        cur = torch.cuda.current_stream(t["dev"])
++        # 1. finished counter snapshots -> decode intervals -> policy
++        while self._snaps and self._snaps[0][2].query():
++            self._consume()
++        # 2. drain before a streamed prefill (its groups need every slot published)
++        from sglang.srt.layers.moe.kt_stream_prefill import STREAM_THRESHOLD
++
++        drain = not decode and STREAM_THRESHOLD > 0 and tokens >= STREAM_THRESHOLD
++        plans = []
++        if drain:
++            self._stat["drains"] += 1
++            for _ in range(64):
++                if ctl.transit() == 0:
++                    break
++                deadline = time.time() + DRAIN_TIMEOUT_S
++                for jb in list(self._jobs.values()):
++                    if not jb.enqueued.wait(max(0.0, deadline - time.time())):
++                        raise RuntimeError("A1_DRAIN_TIMEOUT: a copy was not staged in time")
++                    jb.copy_done.synchronize()
++                plans.append(self._begin(cur, allow_unpublish=False))
++            else:
++                raise RuntimeError("A1_DRAIN_TIMEOUT: slots still in transit")
++            self._refresh_virt(cur)
++        else:
++            plans.append(self._begin(cur, allow_unpublish=True))
++        # 3. counter snapshot (counts up to the previous step); never overwrite an unread one
++        while len(self._snaps) >= SNAP_RING - 1:
++            self._snaps[0][2].synchronize()
++            self._consume()
++        bi = self._snap_i % SNAP_RING
++        self._snap_i += 1
++        t["snap"][bi].copy_(t["counts"], non_blocking=True)
++        ev = torch.cuda.Event()
++        ev.record(cur)
++        self._snaps.append((ctl.hook, decode, ev, bi))
++        self._maybe_stat(ctl, time.monotonic())
++
++    def _consume(self) -> None:
++        """Oldest finished snapshot k: counts up to step k-1 minus counts up to step k-2 = step k-1, which ran with
++        the tables of the previous entry's hook and in its forward mode."""
++        h, was_decode, _ev, bi = self._snaps.pop(0)
++        now = self.tables["snap"][bi].numpy().astype(np.int64)
++        if self._snap_prev is not None:
++            d = counts_delta(now, self._snap_prev)
++            ph, pdec = self._snap_prev_meta
++            counters = self.ctl.account(d[self._order].astype(np.float64), pdec, mask_hook=ph,
++                                        now=time.monotonic())
++            self.stat.step(time.monotonic(), pdec, counters.sel, counters.hits, counters.no_cpu_layers,
++                           counters.active_layers)
++        self._snap_prev = now
++        self._snap_prev_meta = (h, was_decode)
++
++    def _begin(self, cur, allow_unpublish: bool):
++        ctl, t = self.ctl, self.tables
++        now = time.monotonic()
++        done = []
++        for seq, jb in list(self._jobs.items()):
++            if jb.enqueued.is_set() and jb.copy_done.query():
++                if not self._canary_ok(self.ring[jb.entry]):
++                    raise RuntimeError(f"A1_CANARY_MISMATCH: copy {jb.job} landed different bytes")
++                self._free.put(jb.entry)
++                for part, share, ms in jb.parts:   # stage time per source (page cache / device)
++                    self.stat.stage_time(part, share, ms)
++                self.stat.stage_job(jb.t_staged * 1e3)   # duration of one complete staged copy
++                done.append(seq)
++                del self._jobs[seq]
++                self._trace("done", jb.job.layer_idx, jb.job.slot, jb.job.phys)
++        plan = ctl.begin_hook(done, allow_unpublish=allow_unpublish, now=now)
++        if plan.unpublish or plan.publish:
++            self._apply(plan, cur)
++        if plan.record_read_done:
++            ev = torch.cuda.Event()
++            ev.record(cur)  # end of the previous step: the last reader of every slot unpublished here
++            for li, _p, s in plan.unpublish:
++                self._slot_ev[(li, s)] = ev
++        for job in plan.copies:
++            li = self._order[job.layer]
++            xj = _XJob(job.seq, li, job.slot, job.phys, int(ctl.p2l[job.layer, job.phys]))
++            ev_read = self._slot_ev.get((job.layer, job.slot))
++            if ev_read is None:
++                raise RuntimeError(f"A1_EXEC: no read-done event for {xj}")
++            jb = _Job(xj, ev_read)
++            self._jobs[job.seq] = jb
++            self._q.put(jb)
++            self._trace("copy", li, job.slot, job.phys)
++        for li, p, s in plan.unpublish:
++            self._trace("unpublish", self._order[li], s, p)
++        for li, p, s in plan.publish:
++            self._trace("publish", self._order[li], s, p)
++        return plan
++
++    def _apply(self, plan, cur) -> None:
++        """Stream-ordered table writes for this hook: phys2slot and the device mask by one H2D + scatter, KT's
++        pinned mask by one D2H per changed layer, phys2virt rows of changed layers without slots in transit."""
++        t, ctl = self.tables, self.ctl
++        arr = torch.tensor(plan_updates(plan, self._order), dtype=torch.int64).pin_memory()
++        scatter_tables_(t["p2s"], t["mask"], arr.to(t["dev"], non_blocking=True))
++        for li in plan.changed_layers:
++            layer_idx = self._order[li]
++            method, _ = self.layers[layer_idx]
++            method.wrapper.gpu_experts_mask.copy_(t["mask"][layer_idx], non_blocking=True)
++            self._virt_dirty.add(li)
++        self._refresh_virt(cur)
++
++    def _refresh_virt(self, cur) -> None:
++        """phys2virt rows (device) and virt->phys (host) of changed layers, once no slot of the layer is in transit.
++        The pinned sources stay alive through torch's host allocator until their copy ran."""
++        t, ctl = self.tables, self.ctl
++        for li in sorted(self._virt_dirty):
++            if (ctl.slot_pub[li] < 0).any():
++                continue
++            p2v, v2p = ctl.virt_row(li)
++            t["p2v"][self._order[li]].copy_(torch.from_numpy(p2v).pin_memory(), non_blocking=True)
++            self._v2p[li] = v2p
++            self._virt_dirty.discard(li)
++
++    # ------------------------------------------------------------------ trace / stats
++    def _trace(self, what, layer_idx, slot, phys) -> None:
++        if self.trace is not None:
++            self.trace.write(json.dumps({"t": time.time_ns(), "hook": self.ctl.hook, "ev": what, "layer": layer_idx,
++                                         "slot": slot, "phys": phys}) + "\n")
++
++    def _maybe_stat(self, ctl, now: float) -> None:
++        """Emit the statistics line when its window is over: hit rate OF THE WINDOW, cumulative rate next to it,
++        the layer picture, the queue and the stage times split by source."""
++        st = ctl.stats
++        self.stat.state(len(ctl.queue) + len(ctl.inflight), len(ctl.queue), len(self._jobs), ctl.transit(),
++                        self._stat["drains"])
++        line = self.stat.line(now, st["live_hits"], st["live_sel"], ctl.policy.total_hits /
++                              max(ctl.policy.total_selections, 1.0),
++                              cum={"policy_swaps": st["policy_swaps"], "copies": st["copies"],
++                                   "published": st["published"], "dropped": st["dropped"]})
++        if line is None:
++            return
++        logger.info("%s", line)
++        if self.trace is not None:
++            self.trace.flush()
++
++
++class _XJob:
++    __slots__ = ("seq", "layer_idx", "slot", "phys", "logical")
++
++    def __init__(self, seq, layer_idx, slot, phys, logical):
++        self.seq, self.layer_idx, self.slot, self.phys, self.logical = seq, layer_idx, slot, phys, logical
++
++    def __repr__(self):
++        return f"copy(seq={self.seq}, layer={self.layer_idx}, slot={self.slot}, phys={self.phys})"
+diff -ruN a/python/sglang/srt/layers/moe/a1_policy.py b/python/sglang/srt/layers/moe/a1_policy.py
+--- a/python/sglang/srt/layers/moe/a1_policy.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/a1_policy.py	2026-10-18 12:44:34.835468062 +0200
+@@ -0,0 +1,234 @@
++"""Dynamic GPU expert cache policy (A1): decayed LFU with hysteresis and a per-token swap budget.
++
++Pure library: numpy only, no torch. One `ExpertCachePolicy` instance holds, per MoE layer,
++  * a permutation physical -> logical expert (`p2l`); physical slots 0..slots-1 are the GPU slots,
++    physical slots slots..num_experts-1 are CPU positions (same convention as the fork's
++    `--init-expert-location` / `physical_to_logical_map`),
++  * a decayed routing score per logical expert,
++  * a swap credit per layer.
++
++Per decode step the caller passes routing counts (layers x num_experts, how often each logical expert was
++selected in this step, summed over the batch rows) and receives a list of `Swap`s that respect the budget.
++The policy commits the swaps to its own map immediately; the caller is responsible for copying the
++weights and publishing the new map only after the copy event.
++
++Policy update semantics:
++  score *= 0.5 ** (1 / half_life); score += counts
++  credit = min(credit + budget / layers, credit_cap)
++  up to `max_rounds` rounds: for every layer with credit >= 1, admit the best uncached expert and evict the
++  worst cached one if score_admit > score_evict * hysteresis + margin (strict), credit -= 1.
++"""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++
++import numpy as np
++
++__all__ = ["Swap", "StepResult", "ExpertCachePolicy", "PolicyConfig"]
++
++
++@dataclass(frozen=True)
++class Swap:
++    """One expert exchange in one layer.
++
++    `gpu_slot` (physical index < slots) changes its content from `evict` to `admit`;
++    `cpu_slot` (physical index >= slots) that held `admit` now holds `evict`.
++    """
++
++    layer: int
++    gpu_slot: int
++    cpu_slot: int
++    evict: int
++    admit: int
++
++
++@dataclass(frozen=True)
++class StepResult:
++    swaps: tuple[Swap, ...]
++    hits: float       # routed selections that hit a GPU-resident expert (map before this step's swaps)
++    selections: float  # all routed selections in this step
++
++
++@dataclass(frozen=True)
++class PolicyConfig:
++    half_life: float = 512.0   # decode tokens; math.inf = no decay
++    hysteresis: float = 1.25
++    margin: float = 0.05
++    budget: float = 2.0        # swaps per decode step summed over all layers (credit budget/layers per layer)
++    credit_cap: float = 3.0
++    max_rounds: int = 3
++    min_residency_s: float = 0.0   # an expert admitted to a slot is protected for that many seconds (0 = off)
++
++    def validate(self) -> None:
++        if not (isinstance(self.half_life, (int, float)) and self.half_life > 0) or math.isnan(self.half_life):
++            raise ValueError(f"half_life must be > 0, got {self.half_life!r}")
++        for name in ("hysteresis", "margin", "budget", "credit_cap", "min_residency_s"):
++            v = getattr(self, name)
++            if not isinstance(v, (int, float)) or not math.isfinite(v):
++                raise ValueError(f"{name} must be a finite number, got {v!r}")
++        if self.hysteresis < 1.0:
++            raise ValueError(f"hysteresis must be >= 1.0, got {self.hysteresis}")
++        if self.margin < 0.0:
++            raise ValueError(f"margin must be >= 0, got {self.margin}")
++        if self.budget < 0.0:
++            raise ValueError(f"budget must be >= 0, got {self.budget}")
++        if self.credit_cap < 1.0:
++            raise ValueError(f"credit_cap must be >= 1, got {self.credit_cap}")
++        if self.min_residency_s < 0.0:
++            raise ValueError(f"min_residency_s must be >= 0, got {self.min_residency_s}")
++        if not isinstance(self.max_rounds, int) or self.max_rounds < 1:
++            raise ValueError(f"max_rounds must be an int >= 1, got {self.max_rounds!r}")
++
++    @property
++    def decay(self) -> float:
++        return 1.0 if math.isinf(self.half_life) else 0.5 ** (1.0 / self.half_life)
++
++
++class ExpertCachePolicy:
++    def __init__(self, p2l, slots: int, config: PolicyConfig | None = None, score0=None):
++        """p2l: (layers, num_experts) permutation physical -> logical; the first `slots` entries per layer are
++        the GPU-resident experts at start. score0: optional (layers, num_experts) start scores indexed by
++        logical expert; default 1.0 for GPU-resident experts, 0.0 otherwise."""
++        self.cfg = config or PolicyConfig()
++        self.cfg.validate()
++        p2l = np.asarray(p2l)
++        if p2l.ndim != 2 or p2l.shape[0] < 1 or p2l.shape[1] < 2:
++            raise ValueError(f"p2l must be 2-D (layers, experts), got shape {p2l.shape}")
++        if not np.issubdtype(p2l.dtype, np.integer):
++            raise ValueError(f"p2l must be integer, got {p2l.dtype}")
++        self.layers, self.num_experts = int(p2l.shape[0]), int(p2l.shape[1])
++        expect = np.arange(self.num_experts)
++        if not (np.sort(p2l, axis=1) == expect[None, :]).all():
++            raise ValueError("p2l rows must be permutations of 0..num_experts-1")
++        if not isinstance(slots, (int, np.integer)) or not (1 <= int(slots) < self.num_experts):
++            raise ValueError(f"slots must be an int in [1, {self.num_experts - 1}], got {slots!r}")
++        self.slots = int(slots)
++        self.p2l = p2l.astype(np.int64).copy()
++        self.l2p = np.empty_like(self.p2l)
++        np.put_along_axis(self.l2p, self.p2l, np.broadcast_to(expect, self.p2l.shape), axis=1)
++        self.mask = self.l2p < self.slots  # (layers, experts) by logical id
++        if score0 is None:
++            self.score = self.mask.astype(np.float64)
++        else:
++            s = np.asarray(score0, dtype=np.float64)
++            if s.shape != self.mask.shape or not np.isfinite(s).all() or (s < 0).any():
++                raise ValueError("score0 must be finite, >= 0 and of shape (layers, experts)")
++            self.score = s.copy()
++        self.credit = np.zeros(self.layers)
++        # Time an expert was last admitted to a slot (seconds of the caller's clock); -inf = settled (the start
++        # placement), so a fresh cache is evictable right away. Read only while min_residency_s > 0.
++        self.t_admit = np.full(self.mask.shape, -np.inf, dtype=np.float64)
++        self._lay = np.arange(self.layers)
++        self.steps = 0
++        self.total_swaps = 0
++        self.total_hits = 0.0
++        self.total_selections = 0.0
++
++    # ------------------------------------------------------------------ inputs
++    def counts_from_topk(self, topk_ids) -> np.ndarray:
++        """(rows, layers, k) logical expert ids -> (layers, experts) counts. Invalid ids (< 0 or >= experts)
++        raise: a silent drop would bias the hit rate."""
++        ids = np.asarray(topk_ids)
++        if ids.ndim == 2:
++            ids = ids[None]
++        if ids.ndim != 3 or ids.shape[1] != self.layers or ids.shape[0] < 1 or ids.shape[2] < 1:
++            raise ValueError(f"topk_ids must be (rows, {self.layers}, k), got {np.asarray(topk_ids).shape}")
++        if not np.issubdtype(ids.dtype, np.integer):
++            raise ValueError(f"topk_ids must be integer, got {ids.dtype}")
++        if ids.min() < 0 or ids.max() >= self.num_experts:
++            raise ValueError(f"topk_ids out of range [0, {self.num_experts}): min {ids.min()} max {ids.max()}")
++        c = np.zeros((self.layers, self.num_experts))
++        lay = np.broadcast_to(self._lay[None, :, None], ids.shape)
++        np.add.at(c, (lay.ravel(), ids.astype(np.int64).ravel()), 1.0)
++        return c
++
++    # ------------------------------------------------------------------ step
++    def step(self, counts, now: float | None = None) -> StepResult:
++        """One decode step. counts: (layers, experts) routing selections per logical expert (>= 0).
++        ``now``: clock in seconds; with ``min_residency_s > 0`` an expert whose admission is younger than that is
++        never evicted (a layer whose whole cache is still protected makes no swap). ``now=None`` = no protection."""
++        c = np.asarray(counts, dtype=np.float64)
++        if c.shape != (self.layers, self.num_experts):
++            raise ValueError(f"counts must have shape {(self.layers, self.num_experts)}, got {c.shape}")
++        if not np.isfinite(c).all() or (c < 0).any():
++            raise ValueError("counts must be finite and >= 0")
++        cfg = self.cfg
++        hits = float((c * self.mask).sum())
++        sel = float(c.sum())
++        self.score *= cfg.decay
++        self.score += c
++        self.credit = np.minimum(self.credit + cfg.budget / self.layers, cfg.credit_cap)
++        swaps: list[Swap] = []
++        lay = self._lay
++        protect = cfg.min_residency_s > 0.0
++        if protect and (now is None or not math.isfinite(float(now))):
++            raise RuntimeError(
++                f"A1_POLICY: min_residency_s={cfg.min_residency_s} needs a finite clock, got now={now!r} "
++                f"(step(..., now=...))")
++        for _ in range(cfg.max_rounds):
++            go = self.credit >= 1.0
++            if not go.any():
++                break
++            admit = np.where(self.mask, -np.inf, self.score).argmax(axis=1)
++            if protect:
++                old_enough = (float(now) - self.t_admit) >= cfg.min_residency_s
++                evictable = (self.mask & old_enough).any(axis=1)
++                evict = np.where(self.mask & old_enough, self.score, np.inf).argmin(axis=1)
++            else:
++                evictable = np.ones(self.layers, dtype=bool)
++                evict = np.where(self.mask, self.score, np.inf).argmin(axis=1)
++            gain = self.score[lay, admit] > self.score[lay, evict] * cfg.hysteresis + cfg.margin
++            do = go & gain & evictable
++            if not do.any():
++                break
++            for li in np.nonzero(do)[0]:
++                swaps.append(self._apply(int(li), int(evict[li]), int(admit[li]), now))
++            self.credit[do] -= 1.0
++        self.steps += 1
++        self.total_swaps += len(swaps)
++        self.total_hits += hits
++        self.total_selections += sel
++        return StepResult(tuple(swaps), hits, sel)
++
++    def mark_resident(self, layer: int, expert: int, now: float) -> None:
++        """The expert was published in a slot at ``now`` -- its protection starts here. Public because in the
++        executor the policy's decision is only a target: the slot gets the bytes later (a1_swap.publish)."""
++        if not (0 <= int(layer) < self.layers) or not (0 <= int(expert) < self.num_experts):
++            raise ValueError(f"mark_resident({layer}, {expert}) outside {(self.layers, self.num_experts)}")
++        if not np.isfinite(now):
++            raise ValueError(f"mark_resident: now={now!r} is not finite")
++        self.t_admit[int(layer), int(expert)] = float(now)
++
++    def _apply(self, layer: int, evict: int, admit: int, now: float | None = None) -> Swap:
++        gs = int(self.l2p[layer, evict])
++        cs = int(self.l2p[layer, admit])
++        if not (gs < self.slots <= cs):  # internal invariant; never expected
++            raise RuntimeError(f"invariant broken in layer {layer}: evict slot {gs}, admit slot {cs}")
++        self.p2l[layer, gs], self.p2l[layer, cs] = admit, evict
++        self.l2p[layer, admit], self.l2p[layer, evict] = gs, cs
++        self.mask[layer, admit] = True
++        self.mask[layer, evict] = False
++        if self.cfg.min_residency_s > 0.0 and now is not None:
++            self.t_admit[layer, admit] = float(now)
++            self.t_admit[layer, evict] = -np.inf
++        return Swap(layer, gs, cs, evict, admit)
++
++    # ------------------------------------------------------------------ checks
++    def check_invariants(self) -> None:
++        """Raise if p2l/l2p/mask disagree (used by tests and by executor debug builds)."""
++        expect = np.arange(self.num_experts)
++        if not (np.sort(self.p2l, axis=1) == expect[None, :]).all():
++            raise AssertionError("p2l is not a permutation")
++        if not (np.take_along_axis(self.l2p, self.p2l, axis=1) == expect[None, :]).all():
++            raise AssertionError("l2p is not the inverse of p2l")
++        if not ((self.l2p < self.slots) == self.mask).all():
++            raise AssertionError("mask disagrees with l2p")
++        if not (self.mask.sum(axis=1) == self.slots).all():
++            raise AssertionError("cached count per layer != slots")
++
++    @property
++    def hit_rate(self) -> float:
++        if self.total_selections <= 0:
++            raise ValueError("no selections observed")
++        return self.total_hits / self.total_selections
+diff -ruN a/python/sglang/srt/layers/moe/a1_stat.py b/python/sglang/srt/layers/moe/a1_stat.py
+--- a/python/sglang/srt/layers/moe/a1_stat.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/a1_stat.py	2026-10-18 12:44:34.836072504 +0200
+@@ -0,0 +1,236 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Window statistics and the page-cache probe of the dynamic expert cache.
++
++Pure python/numpy plus libc, no torch, so the numbers can be checked without a device:
++
++* ``WindowStats``: the executor feeds it one decode step (routing selections, hits, layers without a CPU expert)
++  and every finished copy (stage milliseconds, source class). Once per ``interval_s`` it renders ONE log line
++  ``A1_STAT ...`` whose hit rate belongs to THAT WINDOW (the cumulative value is printed next to it).
++* ``stat_interval_s``: ``SGLANG_DS41_MU_A1_STAT_S`` (fail-closed, default 60.0 seconds).
++* ``resident_pages``: mincore(2) on the checkpoint mapping, so a stage time can be attributed to the page cache or
++  to the NVMe device.
++
++The clock is passed in, never read inside: the executor hands over ``time.monotonic()``, the offline tests replay
++recorded hook times from ``a1-trace.jsonl`` or a declared step time base.
++"""
++from __future__ import annotations
++
++import ctypes
++import os
++from typing import Mapping, Optional
++
++import numpy as np
++
++ENV_STAT_S = "SGLANG_DS41_MU_A1_STAT_S"
++STAT_S_DEFAULT = 60.0
++STAT_S_MIN = 0.05
++STAT_S_MAX = 3600.0
++STAGE_SAMPLES = 256      # stage samples kept per window and class (percentiles need a bounded buffer)
++RESIDENT_CLASSES = ("resident", "disk")
++CHECKPOINT_PARTS = ("gate_w", "up_w", "down_w", "gate_s", "up_s", "down_s")   # names of a1_exec.CheckpointExperts
++
++__all__ = ["ENV_STAT_S", "STAT_S_DEFAULT", "STAGE_SAMPLES", "WindowStats", "stat_interval_s", "resident_pages",
++           "percentiles"]
++
++
++def stat_interval_s(environ: Optional[Mapping[str, str]] = None) -> float:
++    """``STAT_S`` from the environment: unset or empty -> STAT_S_DEFAULT (60 s); otherwise a finite
++    number inside [STAT_S_MIN, STAT_S_MAX]. Every other value raises (A1_ENV), never a silent default."""
++    env = os.environ if environ is None else environ
++    raw = env.get(ENV_STAT_S)
++    if raw is None or raw.strip() == "":
++        return STAT_S_DEFAULT
++    try:
++        v = float(raw)
++    except (TypeError, ValueError):
++        raise RuntimeError(f"A1_ENV: {ENV_STAT_S}={raw!r} is not a number") from None
++    if not np.isfinite(v) or not (STAT_S_MIN <= v <= STAT_S_MAX):
++        raise RuntimeError(f"A1_ENV: {ENV_STAT_S}={raw!r} outside [{STAT_S_MIN}, {STAT_S_MAX}]")
++    return v
++
++
++def percentiles(values, qs=(50.0, 99.0)):
++    """Percentiles of a non-empty sequence (numpy's linear interpolation); raises on an empty input."""
++    a = np.asarray(values, dtype=np.float64)
++    if a.size == 0:
++        raise ValueError("percentiles of an empty sample")
++    return tuple(float(np.percentile(a, q)) for q in qs)
++
++
++_LIBC = None
++
++
++def _libc():
++    """libc handle for mincore(2), built once (the executor calls the probe six times per staged copy)."""
++    global _LIBC
++    if _LIBC is None:
++        lib = ctypes.CDLL("libc.so.6", use_errno=True)
++        lib.mincore.restype = ctypes.c_int
++        lib.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p)
++        _LIBC = lib
++    return _LIBC
++
++
++def resident_pages(addr: int, nbytes: int, page_size: Optional[int] = None) -> tuple[int, int]:
++    """(resident, total) pages of the file mapping that covers ``[addr, addr + nbytes)`` via mincore(2); the start
++    address is rounded down to a page. A resident page sits in the page cache, everything else has to come from the
++    device. Nothing is faulted in here: mincore only reports. Raises RuntimeError with the errno on failure."""
++    if nbytes <= 0:
++        raise ValueError(f"nbytes must be > 0, got {nbytes}")
++    ps = int(page_size or os.sysconf("SC_PAGE_SIZE"))
++    if ps <= 0 or ps & (ps - 1):
++        raise ValueError(f"page size {ps} is not a power of two")
++    start = int(addr) - (int(addr) % ps)
++    span = int(addr) + int(nbytes) - start
++    total = (span + ps - 1) // ps
++    vec = ctypes.create_string_buffer(total)
++    rc = _libc().mincore(ctypes.c_void_p(start), ctypes.c_size_t(span), vec)
++    if rc != 0:
++        err = ctypes.get_errno()
++        raise RuntimeError(f"A1_STAT: mincore({start:#x}, {span}) failed with errno {err}")
++    raw = vec.raw[:total]
++    resident = sum(1 for b in raw if b & 1)
++    return resident, total
++
++
++class WindowStats:
++    """Counters of one statistics window; ``line()`` renders and resets when the interval is over.
++
++    ``step`` counts a decode step (``sel`` routed selections, ``hits`` of them on a GPU-resident expert,
++    ``no_cpu_layers`` MoE layers whose selections all landed on GPU experts, ``active_layers`` layers with at least
++    one selection). ``state`` carries the queue picture of the last hook, ``stage`` one finished copy.
++    """
++
++    def __init__(self, interval_s: float, start: float, tags: Optional[Mapping[str, object]] = None):
++        if not np.isfinite(interval_s) or interval_s <= 0:
++            raise ValueError(f"interval_s must be finite and > 0, got {interval_s!r}")
++        self.interval_s = float(interval_s)
++        self.tags = dict(tags or {})
++        for key, value in self.tags.items():
++            if not key.isidentifier() or not isinstance(value, (int, float, str)):
++                raise ValueError(f"A1_STAT: tag {key!r}={value!r} is not a plain key/value pair")
++        self.windows = 0
++        self.drains_total = 0      # cumulative over the run, never reset per window
++        self.backlog_max_cum = 0   # same for the backlog maximum
++        self.reset(float(start))
++
++    def reset(self, now: float) -> None:
++        self.t_start = float(now)
++        self.steps = 0
++        self.dec_steps = 0
++        self.sel = 0.0
++        self.hits = 0.0
++        self.no_cpu = []
++        self.active = []
++        self.stage = {name: [] for name in RESIDENT_CLASSES}   # per staged PART (six per copy)
++        self.stage_job_ms = []                                 # per finished COPY (all six parts)
++        self.hooks = 0
++        self.state_last = {"backlog": 0, "queue": 0, "inflight": 0, "transit": 0}
++        self.backlog_max = 0                                   # maximum of THIS window
++
++    # ------------------------------------------------------------------ inputs
++    def step(self, now: float, decode: bool, sel: float, hits: float, no_cpu_layers: int = 0,
++             active_layers: int = 0) -> None:
++        if not (np.isfinite(sel) and np.isfinite(hits)) or sel < 0 or hits < 0 or hits > sel + 1e-9:
++            raise ValueError(f"A1_STAT: sel={sel!r} hits={hits!r} are not a hit count")
++        self.steps += 1
++        if not decode:
++            return
++        self.dec_steps += 1
++        self.sel += float(sel)
++        self.hits += float(hits)
++        self.no_cpu.append(int(no_cpu_layers))
++        self.active.append(int(active_layers))
++
++    def stage_time(self, part: str, resident_share: float, ms: float) -> None:
++        """One finished staged part (``part``: checkpoint part name): ``resident_share`` = share of its pages that
++        were in the page cache before the copy (>= 0.99 counts as 'resident', else 'disk')."""
++        if not np.isfinite(ms) or ms < 0:
++            raise ValueError(f"A1_STAT: stage time {ms!r} for {part} is not finite and >= 0")
++        if not (0.0 <= resident_share <= 1.0):
++            raise ValueError(f"A1_STAT: resident share {resident_share!r} outside [0, 1]")
++        if part not in CHECKPOINT_PARTS:
++            raise ValueError(f"A1_STAT: unknown checkpoint part {part!r}, expected one of {CHECKPOINT_PARTS}")
++        name = "resident" if resident_share >= 0.99 else "disk"
++        buf = self.stage[name]
++        if len(buf) < STAGE_SAMPLES:
++            buf.append(float(ms))
++
++    def state(self, backlog: int, queue: int, inflight: int, transit: int, drains: int = 0) -> None:
++        """The queue picture at the end of one hook (called once per hook, so it counts the hooks of the window)."""
++        self.state_last = {"backlog": int(backlog), "queue": int(queue), "inflight": int(inflight),
++                           "transit": int(transit)}
++        self.drains_total = int(drains)
++        self.hooks += 1
++        self.backlog_max = max(self.backlog_max, int(backlog))
++        self.backlog_max_cum = max(self.backlog_max_cum, int(backlog))
++
++    # ------------------------------------------------------------------ output
++    def stage_job(self, ms: float) -> None:
++        """Duration of one finished copy (all six parts).
++        The per-part split lives in the resident/disk classes below."""
++        if not np.isfinite(ms) or ms < 0:
++            raise ValueError(f"A1_STAT: stage job time {ms!r} is not finite and >= 0")
++        self.stage_job_ms.append(float(ms))
++
++    def due(self, now: float) -> bool:
++        return (float(now) - self.t_start) >= self.interval_s
++
++    def line(self, now: float, cum_hits: float, cum_sel: float, cum_policy: float = float("nan"),
++             cum: Optional[Mapping[str, object]] = None) -> Optional[str]:
++        """The window line, or None while the interval is still running. Resets the window on emission.
++
++        ``cum`` carries the cumulative counters of the controller (policy_swaps/copies/published/dropped), so the log
++        keeps cumulative counters next to the window numbers. Field names identify their units:
++        ``steps`` = consumed steps of the window, ``hooks`` = hooks of the window,
++        ``backlog_max_win``/``backlog_max_cum`` = backlog maximum of the window / of the run, and the stage times are
++        printed twice: ``stage_job_ms_p50/p99``+``over5ms`` per finished copy and
++        ``stage_part_ms_p50/p99`` per staged part (six per copy), split by source class in ``stage_src``."""
++        if not self.due(now):
++            return None
++        win_s = float(now) - self.t_start
++        c_win = (self.hits / self.sel) if self.sel > 0 else float("nan")
++        c_cum = (cum_hits / cum_sel) if cum_sel > 0 else float("nan")
++        part_ms = [v for name in RESIDENT_CLASSES for v in self.stage[name]]
++        job_ms = self.stage_job_ms
++        if part_ms:
++            part_p50, part_p99 = percentiles(part_ms)
++        else:
++            part_p50 = part_p99 = float("nan")
++        if job_ms:
++            job_p50, job_p99 = percentiles(job_ms)
++            over5 = sum(1 for v in job_ms if v > 5.0) / len(job_ms)
++        else:
++            job_p50 = job_p99 = float("nan")
++            over5 = float("nan")
++        src = []
++        for name in RESIDENT_CLASSES:
++            buf = self.stage[name]
++            src.append(f"{name}:{len(buf)}:{np.mean(buf):.3f}" if buf else f"{name}:0:nan")
++        nc = np.asarray(self.no_cpu, dtype=np.int64)
++        ac = np.asarray(self.active, dtype=np.int64)
++        text = (
++            f"A1_STAT win_s={win_s:.2f} hooks={self.hooks} steps={self.steps} dec={self.dec_steps} "
++            f"sel={self.sel:.0f} c_win={c_win:.4f} c_cum={c_cum:.4f} c_pol={cum_policy:.4f} "
++            f"no_cpu_avg={np.mean(nc) if nc.size else float('nan'):.2f} "
++            f"no_cpu_min={int(nc.min()) if nc.size else -1} no_cpu_max={int(nc.max()) if nc.size else -1} "
++            f"active_avg={np.mean(ac) if ac.size else float('nan'):.1f} "
++            f"backlog={self.state_last['backlog']} backlog_max_win={self.backlog_max} "
++            f"backlog_max_cum={self.backlog_max_cum} queue={self.state_last['queue']} "
++            f"inflight={self.state_last['inflight']} transit={self.state_last['transit']} "
++            f"drains={self.drains_total} "
++            f"stage_job_ms_p50={job_p50:.2f} stage_job_ms_p99={job_p99:.2f} over5ms={over5:.3f} "
++            f"stage_part_ms_p50={part_p50:.2f} stage_part_ms_p99={part_p99:.2f} stage_src={','.join(src)}"
++        )
++        for key in sorted(cum or {}):
++            text += f" {key}={cum[key]}"
++        for key in sorted(self.tags):
++            text += f" {key}={self.tags[key]}"
++        self.windows += 1
++        self.reset(now)
++        return text
++
++    # ------------------------------------------------------------------ views (tests)
++    def window_c(self) -> float:
++        """Hit rate of the window just run (nan without decode selections)."""
++        return (self.hits / self.sel) if self.sel > 0 else float("nan")
+diff -ruN a/python/sglang/srt/layers/moe/a1_swap.py b/python/sglang/srt/layers/moe/a1_swap.py
+--- a/python/sglang/srt/layers/moe/a1_swap.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/a1_swap.py	2026-10-18 12:44:34.834867370 +0200
+@@ -0,0 +1,306 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Host-side swap controller for the dynamic GPU expert cache.
++
++Pure numpy, no torch, no CUDA: this module decides WHAT happens at a step boundary; the executor in a1_cache.py
++does it on the device. Physical expert ids are fixed (the start placement); only two per-layer tables change:
++
++* ``phys2slot`` (physical id -> GPU slot or -1), mirrored here; the device copy and KT's pinned mask
++  (``phys2slot >= 0``) are written from the plans this controller returns.
++* the slot contents, refilled by copy jobs.
++
++Protocol per GPU slot s:
++1. ``unpublish``: the old expert leaves the tables at hook h (lazy: only when its copy is about to start, so the
++   slot keeps serving until then). From step h on nothing reads s.
++2. the copy job carries ``release_hook = h``; the executor makes the copy wait for the read-done event recorded at
++   hook h (= end of step h-1, the last step that could read s).
++3. ``publish``: at a later hook, only after the executor reported the job done (copy event complete, canary ok).
++
++Targets come from the policy as a SET per layer: experts the policy keeps stay in their slot, an
++expert the policy drops and takes back before its slot was refilled simply keeps its slot (no copy). Decisions are
++never capped (the numbers stay those of the oracle); the copies run through at most ``max_inflight`` slots.
++"""
++from __future__ import annotations
++
++import math
++from collections import deque
++from dataclasses import dataclass, field
++
++import numpy as np
++
++try:  # inside the fork tree
++    from sglang.srt.layers.moe.a1_policy import ExpertCachePolicy, PolicyConfig
++except ImportError:  # tests load the file directly
++    from a1_policy import ExpertCachePolicy, PolicyConfig  # type: ignore
++
++__all__ = ["CopyJob", "HookPlan", "SwapController"]
++
++
++@dataclass(frozen=True)
++class CopyJob:
++    seq: int
++    layer: int
++    slot: int
++    phys: int
++    release_hook: int
++
++
++@dataclass
++class HookPlan:
++    hook: int
++    unpublish: list = field(default_factory=list)   # (layer, phys, slot)
++    publish: list = field(default_factory=list)     # (layer, phys, slot)
++    dropped: list = field(default_factory=list)     # seqs whose copy finished for an outdated target
++    copies: list = field(default_factory=list)      # CopyJob
++    changed_layers: tuple = ()
++
++    @property
++    def record_read_done(self) -> bool:
++        return bool(self.unpublish)
++
++    @property
++    def empty(self) -> bool:
++        return not (self.unpublish or self.publish or self.copies or self.dropped)
++
++
++@dataclass(frozen=True)
++class StepCounters:
++    """What one counted step looked like: the swaps the policy decided, the routed selections, the GPU hits and
++    the layer picture of the step -- ``no_cpu_layers`` = MoE layers whose selections all hit GPU experts (their
++    forward never touches the CPU path), ``active_layers`` = layers with at least one selection."""
++
++    swaps: int
++    sel: float
++    hits: float
++    no_cpu_layers: int
++    active_layers: int
++
++
++class SwapController:
++    def __init__(self, p2l, slots: int, config: PolicyConfig | None = None, max_inflight: int = 8,
++                 history: int = 64):
++        p2l = np.asarray(p2l)
++        self.policy = ExpertCachePolicy(p2l, slots, config)  # validates p2l, slots, config
++        if not isinstance(max_inflight, int) or max_inflight < 1:
++            raise ValueError(f"max_inflight must be an int >= 1, got {max_inflight!r}")
++        self.layers, self.num_experts, self.slots = self.policy.layers, self.policy.num_experts, self.policy.slots
++        self.max_inflight = max_inflight
++        self.p2l = p2l.astype(np.int64).copy()  # static: physical -> logical (start placement)
++        self.l2p = np.empty_like(self.p2l)
++        np.put_along_axis(self.l2p, self.p2l, np.broadcast_to(np.arange(self.num_experts), self.p2l.shape), axis=1)
++        L, S, NE = self.layers, self.slots, self.num_experts
++        self.phys2slot = np.full((L, NE), -1, dtype=np.int64)
++        self.phys2slot[:, :S] = np.arange(S)
++        self.slot_pub = np.tile(np.arange(S, dtype=np.int64), (L, 1))   # published physical id, -1 = none
++        self.slot_target = self.slot_pub.copy()                          # wanted physical id
++        self.slot_ready = np.full((L, S), -1, dtype=np.int64)            # copied, not yet published
++        self.slot_seq = np.zeros((L, S), dtype=np.int64)                 # copy in flight (0 = none)
++        self.slot_release = np.full((L, S), -1, dtype=np.int64)          # hook of the last unpublish
++        self.queue: deque = deque()                                      # (layer, slot) waiting for a copy
++        self.inflight: dict[int, CopyJob] = {}
++        self.seq = 0
++        self.hook = -1
++        self._mask_hist: dict[int, np.ndarray] = {-1: self.phys2slot >= 0}
++        self._history = max(2, int(history))
++        self.stats = {"decode_intervals": 0, "other_intervals": 0, "live_hits": 0.0, "live_sel": 0.0,
++                      "policy_swaps": 0, "copies": 0, "published": 0, "dropped": 0, "unpublished": 0,
++                      "backlog_max": 0}
++
++    # ------------------------------------------------------------------ inputs
++    def account(self, counts_phys, decode: bool, mask_hook: int, now: float | None = None) -> StepCounters:
++        """One counted step (counts per physical id, summed over the rows). Live hits use the tables that step ran
++        with (``mask_hook`` = the hook before it). Only decode steps reach the policy (no decay otherwise).
++        ``now``: clock for the minimum residency (required as soon as min_residency_s > 0). Returns the step
++        counters (swaps, selections, hits, layers without a CPU expert)."""
++        c = np.asarray(counts_phys, dtype=np.float64)
++        if c.shape != (self.layers, self.num_experts):
++            raise ValueError(f"counts must have shape {(self.layers, self.num_experts)}, got {c.shape}")
++        if not np.isfinite(c).all() or (c < 0).any():
++            raise ValueError("counts must be finite and >= 0")
++        if mask_hook not in self._mask_hist:
++            raise RuntimeError(f"A1_SWAP: no table state for hook {mask_hook} (history {sorted(self._mask_hist)})")
++        if not decode:
++            self.stats["other_intervals"] += 1
++            return StepCounters(0, 0.0, 0.0, 0, 0)
++        mask = self._mask_hist[mask_hook]
++        sel_l = c.sum(axis=1)
++        cpu_l = (c * ~mask).sum(axis=1)
++        counters = StepCounters(0, float(c.sum()), float((c * mask).sum()),
++                                int(((sel_l > 0) & (cpu_l == 0.0)).sum()), int((sel_l > 0).sum()))
++        self.stats["decode_intervals"] += 1
++        self.stats["live_hits"] += counters.hits
++        self.stats["live_sel"] += counters.sel
++        res = self.policy.step(np.take_along_axis(c, self.l2p, axis=1), now=now)  # logical counts
++        if res.swaps:
++            self.stats["policy_swaps"] += len(res.swaps)
++            for li in sorted({s.layer for s in res.swaps}):
++                self._retarget(li)
++        return StepCounters(len(res.swaps), counters.sel, counters.hits, counters.no_cpu_layers,
++                            counters.active_layers)
++
++    def _retarget(self, li: int) -> None:
++        """Make the layer's slot targets hold exactly the policy's cached set (physical ids)."""
++        want = set(self.l2p[li, np.nonzero(self.policy.mask[li])[0]].tolist())
++        pub, tgt = self.slot_pub[li], self.slot_target[li]
++        new = np.full(self.slots, -1, dtype=np.int64)
++        taken = set()
++        for s in range(self.slots):  # 1) a wanted expert that is still published keeps its slot
++            p = int(pub[s])
++            if p >= 0 and p in want:
++                new[s] = p
++                taken.add(p)
++        for s in range(self.slots):  # 2) a wanted target already on its way keeps its slot
++            t = int(tgt[s])
++            if new[s] < 0 and t in want and t not in taken:
++                new[s] = t
++                taken.add(t)
++        free = [s for s in range(self.slots) if new[s] < 0]
++        need = sorted(want - taken)
++        if len(free) != len(need):
++            raise RuntimeError(f"A1_SWAP layer {li}: {len(free)} free slots for {len(need)} experts")
++        for s, p in zip(free, need):
++            new[s] = p
++        for s in range(self.slots):
++            if new[s] != tgt[s]:
++                tgt[s] = new[s]
++                if (li, s) not in self.queue:
++                    self.queue.append((li, s))
++
++    # ------------------------------------------------------------------ hook
++    def begin_hook(self, done=(), allow_unpublish: bool = True, now: float | None = None) -> HookPlan:
++        """Step boundary. ``done``: seqs of copy jobs the executor found complete and verified. ``now``: clock in
++        seconds for the minimum residency (required as soon as min_residency_s > 0). The table
++        transition (``transition``) is followed by the invariant check of every changed layer; a failed check
++        raises before the new tables are recorded, so the executor never applies them."""
++        plan = self.transition(done, allow_unpublish, now=now)
++        if plan.changed_layers:
++            self.check_layers(plan.changed_layers)
++        h = plan.hook
++        self._mask_hist[h] = self.phys2slot >= 0
++        for k in [k for k in self._mask_hist if k < h - self._history]:
++            del self._mask_hist[k]
++        return plan
++
++    def transition(self, done=(), allow_unpublish: bool = True, now: float | None = None) -> HookPlan:
++        """The state transition of one hook without the invariant check (``begin_hook`` adds it). Exposed so the
++        tests can observe the tables a transition produces even when the check would reject them."""
++        if self.policy.cfg.min_residency_s > 0.0 and (now is None or not math.isfinite(float(now))):
++            raise RuntimeError(
++                f"A1_SWAP: min_residency_s={self.policy.cfg.min_residency_s} needs a finite clock, got now={now!r}")
++        self.hook += 1
++        h = self.hook
++        plan = HookPlan(hook=h)
++        changed = set()
++        for seq in done:
++            job = self.inflight.pop(int(seq), None)
++            if job is None:
++                raise RuntimeError(f"A1_SWAP: unknown or repeated copy seq {seq}")
++            li, s = job.layer, job.slot
++            if self.slot_seq[li, s] != job.seq or self.slot_pub[li, s] != -1:
++                raise RuntimeError(f"A1_SWAP: copy {job} finished on a slot that is not waiting for it")
++            self.slot_seq[li, s] = 0
++            if self.slot_target[li, s] == job.phys:
++                self.slot_ready[li, s] = job.phys
++            else:
++                plan.dropped.append(job.seq)
++                self.stats["dropped"] += 1
++                if (li, s) not in self.queue:
++                    self.queue.append((li, s))
++        # publish every slot whose wanted expert has arrived
++        li_s = np.nonzero((self.slot_pub < 0) & (self.slot_ready >= 0))
++        for li, s in zip(*li_s):
++            li, s = int(li), int(s)
++            p = int(self.slot_ready[li, s])
++            self.slot_ready[li, s] = -1
++            if p != self.slot_target[li, s]:
++                if (li, s) not in self.queue:
++                    self.queue.append((li, s))
++                continue
++            if self.phys2slot[li, p] != -1:
++                raise RuntimeError(f"A1_SWAP layer {li}: expert {p} already published in slot {self.phys2slot[li, p]}")
++            self.phys2slot[li, p] = s
++            self.slot_pub[li, s] = p
++            plan.publish.append((li, p, s))
++            changed.add(li)
++            self.stats["published"] += 1
++            if now is not None:  # the protection of a slot starts when its bytes are published
++                # p is a PHYSICAL id (the slot tables work in that space); t_admit of the policy is indexed by
++                # LOGICAL expert, so the same conversion as in a1_exec._begin (p2l is static, never mutated).
++                self.policy.mark_resident(li, int(self.p2l[li, p]), now)
++        # start copies in decision order, unpublishing lazily
++        keep = deque()
++        while self.queue:
++            li, s = self.queue.popleft()
++            t = int(self.slot_target[li, s])
++            if self.slot_pub[li, s] == t:
++                continue  # cancelled: the wanted expert is still there
++            if self.slot_seq[li, s] != 0 or self.slot_ready[li, s] == t:
++                keep.append((li, s))  # a copy for this slot is still running / waiting to publish
++                continue
++            if len(self.inflight) >= self.max_inflight or (self.slot_pub[li, s] >= 0 and not allow_unpublish):
++                keep.append((li, s))
++                continue
++            if self.slot_pub[li, s] >= 0:
++                old = int(self.slot_pub[li, s])
++                self.phys2slot[li, old] = -1
++                self.slot_pub[li, s] = -1
++                self.slot_release[li, s] = h
++                plan.unpublish.append((li, old, s))
++                changed.add(li)
++                self.stats["unpublished"] += 1
++            self.seq += 1
++            job = CopyJob(self.seq, li, s, t, int(self.slot_release[li, s]))
++            self.inflight[job.seq] = job
++            self.slot_seq[li, s] = job.seq
++            plan.copies.append(job)
++            self.stats["copies"] += 1
++        self.queue = keep
++        self.stats["backlog_max"] = max(self.stats["backlog_max"], len(self.queue) + len(self.inflight))
++        plan.changed_layers = tuple(sorted(changed))
++        return plan
++
++    # ------------------------------------------------------------------ views
++    def transit(self) -> int:
++        """Slots without a published expert (their expert computes on the CPU meanwhile)."""
++        return int((self.slot_pub < 0).sum())
++
++    def pending(self) -> int:
++        return int((self.slot_pub != self.slot_target).sum())
++
++    def virt_row(self, li: int):
++        """Stream prefill under A1: (phys2virt, virt2phys) of a layer with no slot in transit. CPU experts get the
++        virtual ids slots..num_experts-1 in ascending physical order, GPU experts -1; at the start this is the
++        identity on slots..num_experts-1, i.e. today's groups."""
++        if (self.slot_pub[li] < 0).any():
++            raise RuntimeError(f"A1_VIRT_TRANSIT layer {li}: {int((self.slot_pub[li] < 0).sum())} slots in transit")
++        cpu = np.nonzero(self.phys2slot[li] < 0)[0]
++        if cpu.size != self.num_experts - self.slots:
++            raise RuntimeError(f"A1_VIRT_COUNT layer {li}: {cpu.size} CPU experts, expected {self.num_experts - self.slots}")
++        p2v = np.full(self.num_experts, -1, dtype=np.int64)
++        p2v[cpu] = np.arange(self.slots, self.num_experts)
++        return p2v, cpu.astype(np.int64)
++
++    def check_layers(self, layers) -> None:
++        """Mirror invariants: published ids unique per slot and consistent with phys2slot."""
++        for li in layers:
++            p2s = self.phys2slot[li]
++            on = np.nonzero(p2s >= 0)[0]
++            sl = p2s[on]
++            if sl.size and (sl.max() >= self.slots or np.unique(sl).size != sl.size):
++                raise RuntimeError(f"A1_INVARIANT layer {li}: slot ids {sl.tolist()[:8]}")
++            pub = self.slot_pub[li]
++            if not np.array_equal(np.sort(pub[pub >= 0]), np.sort(on)):
++                raise RuntimeError(f"A1_INVARIANT layer {li}: slot table and phys2slot disagree")
++            if not (self.phys2slot[li, pub[pub >= 0]] == np.nonzero(pub >= 0)[0]).all():
++                raise RuntimeError(f"A1_INVARIANT layer {li}: slot table points to other slots")
++            if ((pub >= 0) & (self.slot_seq[li] != 0)).any():
++                raise RuntimeError(f"A1_INVARIANT layer {li}: a published slot has a copy in flight")
++
++    def check_all(self) -> None:
++        self.check_layers(range(self.layers))
++        self.policy.check_invariants()
++
++    @property
++    def live_hit_rate(self) -> float:
++        if self.stats["live_sel"] <= 0:
++            raise ValueError("no decode selections observed")
++        return self.stats["live_hits"] / self.stats["live_sel"]
+diff -ruN a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py	2026-10-18 11:53:23.510404961 +0200
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py	2026-10-18 12:44:34.835837770 +0200
+@@ -117,6 +117,24 @@
+     return topk_ids
+ 
+ 
++# >>> ds41-multi-user A1
++# SGLANG_DS41_MU_A1_CACHE=1 (a1_cache.py, a1_exec.py): the GPU slot of a
++# physical expert id comes from a per-layer device table phys2slot instead of the constant split, KT loads
++# every expert (empty mask) and gets its start mask afterwards; the old mask kernel is a no-op after the
++# gather and is replaced by a1_cache.mask_noop. SGLANG_DS41_MU_A1_SWAP=1 adds the step hook, the routing
++# counter and real swaps (budget > 0). Unset or 0: only this flag is read, the old path runs.
++# Every A1 line sits between these markers; tools/a1_strip.py restores the original byte for byte.
++_A1_ON = os.environ.get("SGLANG_DS41_MU_A1_CACHE", "0") != "0"
++_A1_SWAP = False
++if _A1_ON:
++    from sglang.srt.layers.moe import a1_cache as _a1
++
++    _A1_BUDGET, _A1_SWAP = _a1.check_env()
++    _a1_gather_slots_ = torch.compile(dynamic=True, backend=get_compiler_backend())(_a1.gather_slots_)
++    mask_cpu_expert_ids = _a1.mask_noop
++    if _A1_SWAP:
++        from sglang.srt.layers.moe import a1_exec as _a1x
++# <<< ds41-multi-user A1
+ _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
+ _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+ _routing_state = {}
+@@ -287,6 +305,10 @@
+             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
+             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+             gpu_mask[: self.num_gpu_experts] = True
++            # >>> ds41-multi-user A1
++            if _A1_ON:  # KT loads every expert (empty mask); the start mask follows after load_weights
++                gpu_mask, self._a1_start_mask = _a1.kt_load_mask(gpu_mask)
++            # <<< ds41-multi-user A1
+             KT_LAYERS[self.kt_config.layer_idx] = self
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+@@ -322,6 +344,19 @@
+         if hasattr(self.gpu_method, "process_weights_after_loading"):
+             self.gpu_method.process_weights_after_loading(layer)
+ 
++        # >>> ds41-multi-user A1
++        if _A1_ON:  # per-layer device tables at fixed addresses (graph capture); a reload is refused
++            if "_a1_phys2slot" in self.__dict__:
++                raise RuntimeError("A1_RELOAD_UNSUPPORTED: weights processed twice under A1")
++            if _A1_SWAP:
++                _a1x.runtime().alloc_layer(self)
++            else:
++                self._a1_phys2slot = _a1.start_phys2slot(
++                    int(self.global_num_experts),
++                    int(self.num_gpu_experts),
++                    torch.device("cuda", torch.cuda.current_device()),
++                )
++        # <<< ds41-multi-user A1
+         # 2. Load CPU weights using KT wrapper
+         if self.tp_rank == 0 and self.wrapper is not None:
+             torch.cuda.synchronize()
+@@ -337,6 +372,25 @@
+                 .contiguous()
+             )
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
++            # >>> ds41-multi-user A1
++            if _A1_ON:
++                _a1.apply_start_mask(
++                    self.wrapper.gpu_experts_mask, self._a1_start_mask, self.kt_config.layer_idx
++                )
++                _a1.check_invariant(
++                    self._a1_phys2slot, self.wrapper.gpu_experts_mask, self.num_gpu_experts
++                )
++                if _A1_SWAP:
++                    _a1x.runtime().register_layer(self, layer)
++                logging.getLogger(__name__).info(
++                    "A1_START layer=%s experts=%s gpu=%s kt_loaded_all=1 budget=%s swap=%s",
++                    self.kt_config.layer_idx,
++                    self.global_num_experts,
++                    int(self.wrapper.gpu_experts_mask.sum()),
++                    _A1_BUDGET,
++                    int(_A1_SWAP),
++                )
++            # <<< ds41-multi-user A1
+             logging.getLogger(__name__).info(
+                 "KT_SWIGLU_LIMIT layer=%s method=%s configured=%s effective=%s",
+                 self.kt_config.layer_idx,
+@@ -480,6 +534,10 @@
+         streamer = stream_prefill_for(self, layer, x.shape[0])
+         if streamer is not None:
+             physical_ids = topk_output.topk_ids.clone()
++            # >>> ds41-multi-user A1
++            if _A1_SWAP:  # streamed prefill: CPU experts as virtual ids n..E-1 (drained step, a1_exec)
++                physical_ids = _a1x.runtime().to_virtual(physical_ids, self.kt_config.layer_idx)
++            # <<< ds41-multi-user A1
+ 
+         # Step 1: Submit CPU expert computation (non-blocking)
+         if streamer is None and self.tp_rank == 0:
+@@ -488,6 +546,12 @@
+         # Step 2: Prepare GPU computation by masking CPU expert IDs
+         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+         topk_ids = topk_output.topk_ids
++        # >>> ds41-multi-user A1
++        if _A1_ON:  # physical id -> GPU slot or -1, in place; mask_cpu_expert_ids is mask_noop under A1
++            if _A1_SWAP:  # routing counter for the policy (captured in the decode graphs)
++                _a1x.route_count_(topk_ids, self._a1_counts, self._a1_one)
++            _a1_gather_slots_(topk_ids, self._a1_phys2slot)
++        # <<< ds41-multi-user A1
+         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+ 
+         # Create modified dispatch output for GPU computation
+diff -ruN a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+--- a/python/sglang/srt/layers/moe/kt_stream_prefill.py	2026-10-18 11:53:23.510589515 +0200
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py	2026-10-18 12:44:34.835006073 +0200
+@@ -45,6 +45,15 @@
+ )
+ 
+ logger = logging.getLogger(__name__)
++# >>> ds41-multi-user A1
++# SGLANG_DS41_MU_A1_CACHE=1 + SGLANG_DS41_MU_A1_SWAP=1: the CPU experts of a layer reach this
++# module as virtual ids n..E-1 (kt_ep_wrapper maps them with a1_exec.to_virtual on a drained step), so the
++# groups stay today's ranges; the writer maps a group's virtual ids to the physical experts of its layer.
++# Unset: only these flags are read.
++_A1_SWAP = os.environ.get("SGLANG_DS41_MU_A1_CACHE", "0") != "0" and os.environ.get("SGLANG_DS41_MU_A1_SWAP", "0") == "1"
++if _A1_SWAP and os.environ.get("KT_GPU_STREAM_ZEROCOPY", "0") == "1":
++    raise RuntimeError("A1_ENV: SGLANG_DS41_MU_A1_SWAP is not wired for KT_GPU_STREAM_ZEROCOPY=1")
++# <<< ds41-multi-user A1
+ 
+ STREAM_THRESHOLD = int(os.environ.get("KT_GPU_STREAM_PREFILL", "0") or 0)
+ GROUP_SIZE = int(os.environ.get("KT_GPU_STREAM_GROUP", "32") or 32)
+@@ -717,6 +726,12 @@
+     def _write_group(self, method, host: _HostGroup, experts: List[int]):
+         """Rank 0: kt-kernel copies each expert of the group into every rank's
+         copy of ``host`` (CPU tp part i feeds GPU rank i)."""
++        # >>> ds41-multi-user A1
++        if _A1_SWAP:
++            from sglang.srt.layers.moe.a1_exec import runtime as _a1_runtime
++
++            experts = _a1_runtime().virt_to_phys(method, experts)
++        # <<< ds41-multi-user A1
+         w = method.wrapper
+         per = {name: host.nbytes[name] // self.G for name in _HOST_NAMES}
+         for j, e in enumerate(experts):
+@@ -829,6 +844,12 @@
+     def _write_group_nogil(self, method, host: _HostGroup, experts: List[int]):
+         """_write_group for the P2 writer thread: the wait for kt-kernel does
+         not hold the GIL (CPUInfer.sync_nogil, package-stream)."""
++        # >>> ds41-multi-user A1
++        if _A1_SWAP:
++            from sglang.srt.layers.moe.a1_exec import runtime as _a1_runtime
++
++            experts = _a1_runtime().virt_to_phys(method, experts)
++        # <<< ds41-multi-user A1
+         w = method.wrapper
+         per = {name: host.nbytes[name] // self.G for name in _HOST_NAMES}
+         for j, e in enumerate(experts):
+@@ -1167,7 +1188,7 @@
+             cs.wait_stream(torch.cuda.current_stream(self.device))
+             # The eager warm-up must not touch the real accumulator: it ran
+             # acc.add_ once more than the replay, so the first request per
+-            # chunk size carried the streamed experts twice (09-14, found on
++            # chunk size carried the streamed experts twice (found on
+             # the Qwen3.5-35B bf16 edition with a torch reference check).
+             scratch = torch.zeros_like(g["acc"])
+             with torch.cuda.stream(cs):
+@@ -1178,8 +1199,8 @@
+             # thread_local: the P2 writer thread keeps working during the
+             # capture (event syncs, DMA on its own stream); in the default
+             # "global" mode any such call from another thread invalidates the
+-            # capture ("operation not permitted when stream is capturing",
+-            # cross-thread capture validation). The capturing thread itself stays checked.
++            # capture ("operation not permitted when stream is capturing").
++            # The capturing thread itself stays checked.
+             with torch.cuda.graph(graph, pool=self._graph_pool, stream=cs, capture_error_mode="thread_local"):
+                 self._group_body(layer, gi, base, n, g["xq"], g["sf"], g["w"], g["ids"], g["acc"], g["out"])
+             torch.cuda.current_stream(self.device).wait_stream(cs)
+diff -ruN a/python/sglang/srt/layers/quantization/ds41_mu_b12x.py b/python/sglang/srt/layers/quantization/ds41_mu_b12x.py
+--- a/python/sglang/srt/layers/quantization/ds41_mu_b12x.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/quantization/ds41_mu_b12x.py	2026-10-18 12:44:34.836657556 +0200
+@@ -0,0 +1,237 @@
++"""Decode (small M) block-FP8 GEMMs on FlashInfer ``mm_mxfp8`` backend b12x (SM120).
++
++Opt-in via ``SGLANG_DS41_MU_MXFP8_B12X=1``; with the default ``0`` this module is never consulted and
++the FP8 linear dispatch is unchanged.
++
++Why it is exact on the weight side: DeepSeek-V4.1 stores dense FP8 weights with 32x32 blocks and
++power-of-two (ue8m0) scales. Repeating each block scale over its 32 rows gives the MXFP8 per-row
++[N, K/32] e8m0 layout byte for byte (``fp8_utils.block_fp8_scale_to_mxfp8_e8m0``); the FP8 weight
++bytes are used unchanged. Activations are quantized by the per-token-group (32, ue8m0) quantizer
++itself (a separate JIT copy ``per_token_group_quant_8bit_v2_swz`` whose only change is that the e8m0
++scale byte is stored at its 128x4-swizzled position), so the FP8 activation bytes are those of the
++Triton path by construction. The GEMM accumulation order differs from the Triton kernel, so outputs are
++not guaranteed bit-identical; numerical agreement requires a separate check.
++
++Settings (environment, read once):
++  SGLANG_DS41_MU_MXFP8_B12X         "0" (off, default) | "1" (on); anything else is an error
++  SGLANG_DS41_MU_MXFP8_B12X_SHAPES  comma list "NxK" of weight shapes routed to b12x
++                                 (default: the six decode shapes measured faster than Triton)
++  SGLANG_DS41_MU_MXFP8_B12X_MAX_M   rows per call routed to b12x, 1..8 (default 1); larger M -> Triton
++  SGLANG_DS41_MU_MXFP8_B12X_DUMP    optional directory: for each shape, the eager M == 1 inputs of the FIRST layer
++                                 object seen with that shape are saved (one row per decode step, up to DUMP_N),
++                                 as bf16 tensors (diagnostics only, never inside a graph capture)
++  SGLANG_DS41_MU_MXFP8_B12X_DUMP_N  number of dumped rows per shape (default 64)
++
++Fail-closed: when switched on, a missing FlashInfer b12x runner or a non-SM12x device raises at
++first use instead of silently running Triton. A layer whose scales cannot be mapped (not a positive
++power of two, wrong block size, kernel cannot implement the shape) stays on Triton, logged with a
++reason and counted in ``STATS``.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from functools import lru_cache
++from typing import Dict, FrozenSet, NamedTuple, Optional, Tuple
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++ENV_ON = "SGLANG_DS41_MU_MXFP8_B12X"
++ENV_SHAPES = "SGLANG_DS41_MU_MXFP8_B12X_SHAPES"
++ENV_MAX_M = "SGLANG_DS41_MU_MXFP8_B12X_MAX_M"
++ENV_DUMP = "SGLANG_DS41_MU_MXFP8_B12X_DUMP"
++ENV_DUMP_N = "SGLANG_DS41_MU_MXFP8_B12X_DUMP_N"
++DEFAULT_SHAPES = "32768x1280,5120x8192,4608x5120,5120x2304,25600x6144,4096x1280"
++# (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store):
++# FlashInfer 0.6.18 b12x default plan for M == 1 and the fastest tile in the shape benchmark sweep.
++TACTIC = ((16, 64), (1, 1), False, False, "sm120", None)
++
++STATS: Dict[str, int] = {"allowed": 0, "ready": 0, "failed": 0, "extra_bytes": 0}
++_path_logged: set = set()
++_dump_count: Dict[Tuple[int, int], int] = {}
++_dump_layer: Dict[Tuple[int, int], int] = {}  # id() of the first layer object per shape -> one row per decode step
++
++
++class Settings(NamedTuple):
++    shapes: FrozenSet[Tuple[int, int]]
++    max_m: int
++    dump_dir: Optional[str]
++    dump_n: int
++
++
++def parse_shapes(text: str) -> FrozenSet[Tuple[int, int]]:
++    out = []
++    for raw in text.split(","):
++        item = raw.strip()
++        if not item:
++            raise ValueError(f"{ENV_SHAPES}: empty entry in {text!r}")
++        parts = item.lower().split("x")
++        if len(parts) != 2 or not all(p.isdigit() for p in parts):
++            raise ValueError(f"{ENV_SHAPES}: entry {item!r} is not NxK")
++        n, k = int(parts[0]), int(parts[1])
++        if n <= 0 or k <= 0 or n % 32 or k % 32:
++            raise ValueError(f"{ENV_SHAPES}: {item!r} must be positive multiples of 32")
++        if (n, k) in out:
++            raise ValueError(f"{ENV_SHAPES}: duplicate {item!r}")
++        out.append((n, k))
++    return frozenset(out)
++
++
++def parse_settings(env=None) -> Optional[Settings]:
++    env = os.environ if env is None else env
++    on = env.get(ENV_ON, "0")
++    if on == "0":
++        return None
++    if on != "1":
++        raise ValueError(f"{ENV_ON} must be 0 or 1, got {on!r}")
++    shapes = parse_shapes(env.get(ENV_SHAPES, DEFAULT_SHAPES))
++    max_m_text = env.get(ENV_MAX_M, "1")
++    if not max_m_text.isdigit() or not 1 <= int(max_m_text) <= 8:
++        raise ValueError(f"{ENV_MAX_M} must be an integer 1..8, got {max_m_text!r}")
++    dump_dir = env.get(ENV_DUMP) or None
++    dump_n_text = env.get(ENV_DUMP_N, "64")
++    if not dump_n_text.isdigit() or int(dump_n_text) < 1:
++        raise ValueError(f"{ENV_DUMP_N} must be a positive integer, got {dump_n_text!r}")
++    if dump_dir is not None and not os.path.isdir(dump_dir):
++        raise ValueError(f"{ENV_DUMP} {dump_dir!r} is not an existing directory")
++    return Settings(shapes, int(max_m_text), dump_dir, int(dump_n_text))
++
++
++@lru_cache(maxsize=1)
++def settings() -> Optional[Settings]:
++    s = parse_settings()
++    if s is not None:
++        logger.info("[MXFP8-B12X] on: shapes=%s max_m=%d tactic=%s dump=%s",
++                    sorted(s.shapes), s.max_m, TACTIC, s.dump_dir)
++    return s
++
++
++@lru_cache(maxsize=1)
++def _runtime():
++    """Fail-closed runtime check; returns (runner, can_implement_fn, quantize_fn)."""
++    if not torch.cuda.is_available():
++        raise RuntimeError(f"{ENV_ON}=1 but CUDA is not available")
++    major, minor = torch.cuda.get_device_capability()
++    if major != 12:
++        raise RuntimeError(f"{ENV_ON}=1 needs an SM12x GPU, found sm_{major}{minor}")
++    import cutlass  # noqa: F401  (nvidia-cutlass-dsl, required by b12x)
++    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_gemm_mxfp8_runner
++    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
++        Sm120B12xBlockScaledDenseGemmKernel,
++    )
++
++    from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2_swz import (
++        per_token_group_quant_fp8_swz128x4 as quantize,
++    )
++
++    runner = _b12x_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
++
++    def can_implement(n: int, k: int) -> bool:
++        return bool(
++            Sm120B12xBlockScaledDenseGemmKernel.can_implement(
++                cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, cutlass.BFloat16,
++                TACTIC[0], TACTIC[1], n, k, 1, "k", "k", "n", swap_ab=TACTIC[2],
++            )
++        )
++
++    return runner, can_implement, quantize
++
++
++def prepare_layer(layer: torch.nn.Module, weight_block_size, scale_fmt) -> None:
++    """Called after weight loading for block-quantized FP8 linears when the switch is on."""
++    s = settings()
++    if s is None:
++        return
++    layer.ds41_mu_b12x_ready = False
++    n, k = layer.weight.shape
++    if (n, k) not in s.shapes:
++        return
++    STATS["allowed"] += 1
++    from sglang.srt.layers.quantization.fp8_utils import block_fp8_scale_to_mxfp8_e8m0
++
++    try:
++        if list(weight_block_size or []) != [32, 32]:
++            raise ValueError(f"weight_block_size {weight_block_size} != [32, 32]")
++        if scale_fmt != "ue8m0":
++            raise ValueError(f"scale_fmt {scale_fmt!r} != 'ue8m0'")
++        if layer.weight.dtype != torch.float8_e4m3fn:
++            raise ValueError(f"weight dtype {layer.weight.dtype} != float8_e4m3fn")
++        _, can_implement, _ = _runtime()
++        if not can_implement(n, k):
++            raise ValueError(f"b12x tile {TACTIC[0]} cannot implement N={n} K={k}")
++        scale_u8 = block_fp8_scale_to_mxfp8_e8m0(layer.weight_scale_inv.data, (n, k), [32, 32])
++        from flashinfer import block_scale_interleave
++
++        swz = block_scale_interleave(scale_u8.contiguous()).contiguous()
++    except ValueError as e:
++        STATS["failed"] += 1
++        logger.warning("[MXFP8-B12X] layer N=%d K=%d stays on Triton: %s (failed=%d)", n, k, e, STATS["failed"])
++        return
++    layer.ds41_mu_b12x_scale_swz = torch.nn.Parameter(swz, requires_grad=False)
++    layer.ds41_mu_b12x_ready = True
++    STATS["ready"] += 1
++    STATS["extra_bytes"] += swz.numel() * swz.element_size()
++    logger.info("[MXFP8-B12X] layer N=%d K=%d ready (allowed=%d ready=%d failed=%d extra=%.1f MiB)",
++                n, k, STATS["allowed"], STATS["ready"], STATS["failed"], STATS["extra_bytes"] / 2**20)
++
++
++def _log_path_once(n: int, k: int, m: int, path: str, why: str = "") -> None:
++    key = (n, k, m, path)
++    if key not in _path_logged:
++        _path_logged.add(key)
++        logger.info("[MXFP8-B12X] N=%d K=%d M=%d path=%s%s", n, k, m, path, f" ({why})" if why else "")
++
++
++def wants(layer: torch.nn.Module, x) -> bool:
++    """True when this call goes to b12x; logs (once per shape/M) why an allowed layer does not."""
++    if not getattr(layer, "ds41_mu_b12x_ready", False):
++        return False
++    n, k = layer.weight.shape
++    if not torch.is_tensor(x):
++        _log_path_once(n, k, -1, "triton", "pre-quantized tuple input")
++        return False
++    m = x.numel() // x.shape[-1]
++    if x.dtype != torch.bfloat16:
++        _log_path_once(n, k, m, "triton", f"input dtype {x.dtype}")
++        return False
++    if m > settings().max_m or m == 0:
++        _log_path_once(n, k, m, "triton", f"M={m} outside 1..{settings().max_m}")
++        return False
++    return True
++
++
++def _maybe_dump(x2: torch.Tensor, n: int, k: int, layer: torch.nn.Module) -> None:
++    s = settings()
++    if s is None or s.dump_dir is None or x2.shape[0] != 1:
++        return
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return
++    first = _dump_layer.setdefault((n, k), id(layer))
++    if first != id(layer):
++        return
++    c = _dump_count.get((n, k), 0)
++    if c >= s.dump_n:
++        return
++    _dump_count[(n, k)] = c + 1
++    torch.save(x2.detach().to("cpu", copy=True), os.path.join(s.dump_dir, f"act_N{n}_K{k}_{c:04d}.pt"))
++
++
++def linear(layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
++    runner, _, quantize = _runtime()
++    n, k = layer.weight.shape
++    x2 = x.reshape(-1, x.shape[-1])
++    m = x2.shape[0]
++    if not x2.is_contiguous():
++        x2 = x2.contiguous()
++    _maybe_dump(x2, n, k, layer)
++    q, a_sf = quantize(x2)  # per-token-group quantizer, scales as swizzled e8m0 bytes
++    out = torch.empty((m, n), dtype=torch.bfloat16, device=x2.device)
++    runner(inputs=[q, layer.weight.t(), a_sf, layer.ds41_mu_b12x_scale_swz, torch.bfloat16, out, None],
++           tactic=TACTIC)
++    _log_path_once(n, k, m, "b12x", f"tactic={TACTIC}")
++    if bias is not None:
++        out = out + bias
++    return out.view(*x.shape[:-1], n)
+diff -ruN a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+--- a/python/sglang/srt/layers/quantization/fp8.py	2026-09-10 08:27:42.000000000 +0200
++++ b/python/sglang/srt/layers/quantization/fp8.py	2026-10-18 12:44:34.836800719 +0200
+@@ -71,6 +71,7 @@
+     resolve_mxfp8_dense_gemm_backend,
+ )
+ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
++from sglang.srt.layers.quantization import ds41_mu_b12x
+ from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+ from sglang.srt.layers.quantization.unquant import (
+     UnquantizedFusedMoEMethod,
+@@ -507,6 +508,9 @@
+             self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
+                 self.mxfp8_dense_backend
+             )
++        # ds41-multi-user V2b (SGLANG_DS41_MU_MXFP8_B12X=1): small-M decode GEMMs on FlashInfer b12x.
++        # None when the switch is off -> dispatch below is unchanged.
++        self.ds41_mu_b12x = ds41_mu_b12x.settings()
+         self.is_checkpoint_fp8_serialized = (
+             self.quant_config.is_checkpoint_fp8_serialized
+         )
+@@ -748,6 +752,12 @@
+         layer.weight_scale_inv.data = weight_scale.data
+         if self.block_fp8_as_mxfp8:
+             self._prepare_block_fp8_as_mxfp8(layer)
++        if self.ds41_mu_b12x is not None and not self.use_mxfp8:
++            ds41_mu_b12x.prepare_layer(
++                layer,
++                self.weight_block_size,
++                getattr(self.quant_config, "scale_fmt", None),
++            )
+ 
+         # The preshuffle rewrites the weight into a layout only
+         # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
+@@ -1044,6 +1054,9 @@
+                 bias=bias,
+             )
+ 
++        if self.ds41_mu_b12x is not None and ds41_mu_b12x.wants(layer, x):
++            return ds41_mu_b12x.linear(layer, x, bias)
++
+         if self.use_mxfp8 or (
+             self.block_fp8_as_mxfp8
+             and getattr(layer, "block_fp8_mxfp8_ready", False)
+diff -ruN a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py	2026-10-18 11:53:23.513517754 +0200
++++ b/python/sglang/srt/managers/scheduler.py	2026-10-18 12:44:34.831220305 +0200
+@@ -1287,7 +1287,7 @@
+             try:
+                 return cast(os.environ.get(name, "") or default)
+             except ValueError:
+-                logger.warning(f"[split-prefill] {name} invalid, using {default}")
++                logger.warning(f"[mn-split] {name} invalid, using {default}")
+                 return default
+ 
+         self.ds41_mu_interleave_s = _ds41_mu_env("SGLANG_DS41_MU_INTERLEAVE_MS", 300.0, float) / 1000.0
+@@ -1314,7 +1314,7 @@
+         self._ds41_mu_model_ok = None
+         if self.ds41_mu_interleave:
+             logger.info(
+-                f"[split-prefill] Layer interleaving enabled: budget={self.ds41_mu_interleave_s * 1000:.0f} ms, "
++                f"[mn-split] Layer interleaving enabled: budget={self.ds41_mu_interleave_s * 1000:.0f} ms, "
+                 f"min_tokens={self.ds41_mu_min_tokens}, layers_per_call={self.ds41_mu_layers_per_call}, "
+                 f"force={self.ds41_mu_force}"
+             )
+@@ -2014,7 +2014,7 @@
+ 
+             # Launch the current batch
+             ds41_mu_popped = False
+-            ds41_mu_rollback_oom = False  # True after an OOM rollback.
++            ds41_mu_rollback_oom = False  # Multi-user OOM emergency guard
+             if batch:
+                 if self._ds41_mu_should_split(batch):
+                     # Finish the in-flight batch first to preserve stream token order;
+@@ -4233,10 +4233,10 @@
+             )
+             if not self._ds41_mu_model_ok:
+                 logger.info(
+-                    f"[split-prefill] off: tbo={tbo} prefill_graph_ok={pcg_ok} "
++                    f"[mn-split] off: tbo={tbo} prefill_graph_ok={pcg_ok} "
+                     f"deferred={deferred} encoder_replay={enc_replay}"
+                 )
+-            logger.info(f"[split-prefill] model supports layer split: {self._ds41_mu_model_ok}")
++            logger.info(f"[mn-split] model supports layer split: {self._ds41_mu_model_ok}")
+         return self._ds41_mu_model_ok
+ 
+     def _ds41_mu_note_tokens(self, batch: ScheduleBatch, now: float) -> None:
+@@ -4464,7 +4464,7 @@
+         batch.split_forward_batch = None
+         batch.ds41_mu_split = True
+         t0 = time.perf_counter()
+-        self._ds41_mu_in_split = True  # Track per-request decode gaps.
++        self._ds41_mu_in_split = True  # Track the scheduling gap per request.
+         self._ds41_mu_gap_req = 0.0
+         if self.last_batch is not None and self.last_batch.forward_mode.is_decode():
+             last_decode = t0  # a normal decode step ran right before this split
+@@ -4542,7 +4542,7 @@
+                 if r.rid not in own and prev is not None:
+                     self._ds41_mu_gap_req = max(self._ds41_mu_gap_req, t_end - prev)
+         print(
+-            f"[split-prefill] tokens={batch.extend_num_tokens} reqs={len(batch.reqs)} "
++            f"[mn-split] tokens={batch.extend_num_tokens} reqs={len(batch.reqs)} "
+             f"prefill_s={total:.3f} call_max_ms={call_max * 1000:.0f} "
+             f"decodes={decodes} decode_bs_mean={decode_bs_sum / max(decodes, 1):.2f} "
+             f"gap_max_ms={gap_max * 1000:.0f} quiesce_skips={skipped} "
+@@ -4972,7 +4972,7 @@
+             _ds41_mu_now = time.perf_counter()
+             if batch.forward_mode.is_decode():
+                 self._ds41_mu_t_decode = _ds41_mu_now  # Timestamp of the last decode batch.
+-            self._ds41_mu_note_tokens(batch, _ds41_mu_now)  # Track per-request decode gaps.
++            self._ds41_mu_note_tokens(batch, _ds41_mu_now)  # Track the scheduling gap per request.
+         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+         # Router-facing gauge on the dedicated PUB socket, reusing the
+         # snapshot above rather than walking the queues again.
+diff -ruN a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py	2026-10-18 11:53:23.515262000 +0200
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py	2026-10-18 12:44:34.833955241 +0200
+@@ -1413,7 +1413,7 @@
+     ) -> torch.Tensor:
+         """Index-K rows at `slots` from the layer's latent source; see
+         get_index_k_dequant."""
+-        # SGLang #41345: As with all sibling getters, first wait for the layer's HiCache load-back
++        # sglang #41345: like the other getters, first wait for the layer's HiCache load-back.
+         self.wait_layer_transfer(layer_id)
+         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+         return self._indexer_pool(compress_ratio).get_index_k_dequant(
+@@ -1426,7 +1426,7 @@
+         """Packed fp4 index-K rows at `slots` from the layer's latent source:
+         (payload int8 [n, 64], ue8m0 scales packed int32 [n]), the kernel input
+         layout of quantize_fp4_indexer_tensor."""
+-        # SGLang #41345: As with all sibling getters, first wait for the layer's HiCache load-back
++        # sglang #41345: like the other getters, first wait for the layer's HiCache load-back.
+         self.wait_layer_transfer(layer_id)
+         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+         return self._indexer_pool(compress_ratio).get_index_k_fp4(
+diff -ruN a/python/sglang/srt/mem_cache/ds41_mu_radix_lru.py b/python/sglang/srt/mem_cache/ds41_mu_radix_lru.py
+--- a/python/sglang/srt/mem_cache/ds41_mu_radix_lru.py	2026-10-18 11:53:23.515919923 +0200
++++ b/python/sglang/srt/mem_cache/ds41_mu_radix_lru.py	2026-10-18 12:44:34.833684676 +0200
+@@ -125,9 +125,9 @@
+                 ds41_mu_current_class = DS41_MU_CLASS_DISPOSABLE
+             else:
+                 if self.ds41_mu_node_class(x) != ds41_mu_current_class:
+-                    ds41_mu_message(f"I5 Node {x.id} class {self.ds41_mu_node_class(x)} in segment {ds41_mu_current_class}")
++                    ds41_mu_message(f"I5 node {x.id} class {self.ds41_mu_node_class(x)} in segment {ds41_mu_current_class}")
+                 if x.component_data[ct].value is None:
+-                    ds41_mu_message(f"I5 Node {x.id} has no SWA value in the list")
++                    ds41_mu_message(f"I5 node {x.id} has no SWA value in the list")
+                 ds41_mu_seen += 1
+             x = x.lru_next[pt]
+         if ds41_mu_seen != len(self.cache):
+diff -ruN a/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py b/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py
+--- a/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py	2026-10-18 11:53:23.516420283 +0200
++++ b/python/sglang/srt/mem_cache/unified_cache/components/swa_component.py	2026-10-18 12:44:34.838432032 +0200
+@@ -5,7 +5,7 @@
+ import torch
+ 
+ from sglang.srt.environ import envs
+-from sglang.srt.mem_cache import ds41_mu_hicache as _ds41_mu_hc
++from sglang.srt.mem_cache import ds41_mu_hicache as _ds41_mu_hc  # DS41MU
+ from sglang.srt.mem_cache import ds41_mu_radix as _ds41_mu
+ from sglang.srt.mem_cache.base_prefix_cache import (
+     DecLockRefParams,
+@@ -918,7 +918,7 @@
+         # Unfinished requests can already have an SWA-evicted prefix; preserve
+         # that boundary so insertion creates a tombstone instead of live SWA KV.
+         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+-        if not _ds41_mu.F2:  # Apply SGLang #34565 behavior only when SGLANG_DS41_MU_RADIX_F2 is enabled.
++        if not _ds41_mu.F2:  # DS41MU: enable the port of #34565 only with SGLANG_DS41_MU_RADIX_F2.
+             return None
+ 
+         branching_seqlen = req.swa_branching_seqlen
+@@ -964,7 +964,7 @@
+             _ds41_mu.ds41_mu_after_insertion(
+                 self, req, insert_params, insert_result, is_finished
+             )
+-        if not _ds41_mu.F2:  # Apply SGLang #34565 behavior only when SGLANG_DS41_MU_RADIX_F2 is enabled.
++        if not _ds41_mu.F2:  # DS41MU: enable the port of #34565 only with SGLANG_DS41_MU_RADIX_F2.
+             return
+         if insert_result is not None and insert_result.swa_branch_inserted:
+             req.swa_branching_seqlen = None
+diff -ruN a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py	2026-10-18 11:53:23.516736550 +0200
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py	2026-10-18 12:44:34.838089135 +0200
+@@ -25,7 +25,7 @@
+ 
+ import msgspec
+ import torch
+-from sglang.srt.mem_cache import ds41_mu_hicache as _ds41_mu_hc
++from sglang.srt.mem_cache import ds41_mu_hicache as _ds41_mu_hc  # DS41MU
+ 
+ from sglang.srt.disaggregation.kv_events import StorageMedium
+ from sglang.srt.mem_cache.base_prefix_cache import (
+diff -ruN a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+--- a/python/sglang/srt/model_executor/model_runner.py	2026-09-10 08:27:42.000000000 +0200
++++ b/python/sglang/srt/model_executor/model_runner.py	2026-10-18 12:44:34.834145855 +0200
+@@ -253,6 +253,15 @@
+ 
+ 
+ logger = logging.getLogger(__name__)
++# >>> ds41-multi-user A1
++# SGLANG_DS41_MU_A1_CACHE=1 + SGLANG_DS41_MU_A1_SWAP=1: the dynamic expert cache's step hook runs
++# before every forward on the forward stream (a1_exec.step_hook). Unset: only these flags are read.
++import os as _a1_os
++
++_A1_STEP_HOOK = None
++if _a1_os.environ.get("SGLANG_DS41_MU_A1_CACHE", "0") != "0" and _a1_os.environ.get("SGLANG_DS41_MU_A1_SWAP", "0") == "1":
++    from sglang.srt.layers.moe.a1_exec import step_hook as _A1_STEP_HOOK
++# <<< ds41-multi-user A1
+ 
+ 
+ @dataclass(frozen=True)
+@@ -1609,6 +1618,10 @@
+         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+ 
+         self.forward_pass_id += 1
++        # >>> ds41-multi-user A1
++        if _A1_STEP_HOOK is not None:
++            _A1_STEP_HOOK(forward_batch)
++        # <<< ds41-multi-user A1
+ 
+         # Try msprob debugger
+         if self.msprobe_debugger is not None:
+diff -ruN a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+--- a/python/sglang/srt/models/deepseek_v4.py	2026-10-18 11:53:23.519268682 +0200
++++ b/python/sglang/srt/models/deepseek_v4.py	2026-10-18 12:44:34.832814718 +0200
+@@ -4045,8 +4045,8 @@
+         assert st.get("defer") is None, "deferral: open job after the last layer"
+         hidden_states = st["hidden_states"]
+         pre_hc_head = hidden_states.flatten(1)
+-        # Avoid a .float() copy of the [T, hc*H] fp32 tensor; the kernel
+-        # converts each row to tl.float32, preserving values bit for bit.
++        # ds41-multi-user HC (stream3, stream-prefill §24): no .float() copy [T, hc*H] fp32; the
++        # kernel loads x with .to(tl.float32) per row, so the values are the same bit for bit.
+         hidden_states = hc_combine(
+             pre_hc_head.contiguous(), st["prev_pre"], self.hc_mult, hidden_states.dtype
+         )
+@@ -4596,8 +4596,8 @@
+         if self.hc_pre_from_prev_sublayer:
+             from sglang.kernels.ops.layernorm.mhc import hc_combine
+ 
+-            # Avoid a .float() copy of the [T, hc*H] fp32 tensor; the kernel
+-            # converts each row to tl.float32, preserving values bit for bit.
++            # ds41-multi-user HC (stream3, stream-prefill §24): no .float() copy [T, hc*H] fp32; the
++            # kernel loads x with .to(tl.float32) per row, so the values are the same bit for bit.
+             hidden_states = hc_combine(
+                 pre_hc_head.contiguous(), last_pre, self.hc_mult, hidden_states.dtype
+             )
+@@ -5060,7 +5060,7 @@
+         if is_nextn and name.startswith("mtp."):
+             parts = name.split(".", 2)
+             if len(parts) >= 3:
+-                rest = parts[2]
++                ds41_mu_remaining = parts[2]
+                 nextn_spec_prefixes = [
+                     "e_proj",
+                     "h_proj",
+@@ -5071,19 +5071,19 @@
+                     "head",
+                     "hc_head",
+                 ]
+-                is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
++                is_nextn_spec = any(ds41_mu_remaining.startswith(p) for p in nextn_spec_prefixes)
+                 if is_nextn_spec:
+-                    if rest.startswith("emb.tok_emb"):
+-                        rest = rest.replace("emb.tok_emb", "embed_tokens")
+-                    elif rest == "norm.weight":
+-                        rest = "shared_head.norm.weight"
+-                    elif rest.startswith("head."):
+-                        rest = "shared_head.head.weight"
+-                    elif rest == "e_proj.scale":
+-                        rest = "e_proj.weight_scale_inv"
+-                    elif rest == "h_proj.scale":
+-                        rest = "h_proj.weight_scale_inv"
+-                name = f"model.layers.{num_hidden_layers}." + rest
++                    if ds41_mu_remaining.startswith("emb.tok_emb"):
++                        ds41_mu_remaining = ds41_mu_remaining.replace("emb.tok_emb", "embed_tokens")
++                    elif ds41_mu_remaining == "norm.weight":
++                        ds41_mu_remaining = "shared_head.norm.weight"
++                    elif ds41_mu_remaining.startswith("head."):
++                        ds41_mu_remaining = "shared_head.head.weight"
++                    elif ds41_mu_remaining == "e_proj.scale":
++                        ds41_mu_remaining = "e_proj.weight_scale_inv"
++                    elif ds41_mu_remaining == "h_proj.scale":
++                        ds41_mu_remaining = "h_proj.weight_scale_inv"
++                name = f"model.layers.{num_hidden_layers}." + ds41_mu_remaining
+ 
+         if name.startswith("layers."):
+             name = "model." + name

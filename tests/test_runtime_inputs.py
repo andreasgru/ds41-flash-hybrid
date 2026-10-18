@@ -20,11 +20,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORACLE = ROOT / "tests" / "data" / "recorded-r3.json"
+ORACLE = ROOT / "tests" / "data" / "recorded-k22.json"
 TEMP_PREFIX = "ds41-real-runtime-"
 PUBLIC_ENV_FILTER = re.compile(
     r"^(KT_|DSV41_|SGLANG_|CUDA_|FLASHINFER_|TORCH_|TORCHINDUCTOR_|TRITON_|"
-    r"OMP_|HOME$|XDG_|HF_HOME$|HF_HUB_OFFLINE$|TMPDIR$|"
+    r"A1_SOURCE$|OMP_|HOME$|XDG_|HF_HOME$|HF_HUB_OFFLINE$|TMPDIR$|"
     r"PYTHONPYCACHEPREFIX$|PYTHONPATH$|LD_LIBRARY_PATH$)"
 )
 REQUIRED_ARCHIVE_COMPONENTS = {"sglang", "ktransformers", "llama", "pybind11"}
@@ -125,7 +125,7 @@ class RealRuntimeInputTests(unittest.TestCase):
             raise RuntimeError("RECORDED_ORACLE_SCHEMA_INVALID")
         if cls.oracle.get("substitutions") != ["ROOT", "MODEL", "PYTHON"]:
             raise RuntimeError("RECORDED_ORACLE_SUBSTITUTIONS_INVALID")
-        if len(cls.oracle.get("environment", {})) != 80:
+        if len(cls.oracle.get("environment", {})) != 93:
             raise RuntimeError("RECORDED_ORACLE_ENVIRONMENT_COUNT_INVALID")
         if len(cls.oracle.get("command", [])) != 74:
             raise RuntimeError("RECORDED_ORACLE_COMMAND_COUNT_INVALID")
@@ -313,7 +313,7 @@ class RealRuntimeInputTests(unittest.TestCase):
             and result.get("command") == expected_command
         )
 
-    def test_recorded_r3_environment_and_command_match(self):
+    def test_recorded_k22_environment_and_command_match(self):
         result = self._print_command(self.install)
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(result.stdout)

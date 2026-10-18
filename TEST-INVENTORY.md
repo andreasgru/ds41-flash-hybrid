@@ -2,7 +2,7 @@
 
 ## Scope
 
-This inventory covers `tests/test_real_inputs.py` (12 test methods), `tests/test_runtime_inputs.py` (6 methods), `tests/data/recorded-r3.json`, and their product entry points.
+This inventory covers `tests/test_real_inputs.py` (12 test methods), `tests/test_runtime_inputs.py` (6 methods), `tests/data/recorded-k22.json`, the unchanged historical `tests/data/recorded-r3.json`, and their product entry points.
 
 Neither test file imports or calls `unittest.mock`, `patch`, `Mock`, or `monkeypatch`, and neither replaces a product function. Mutations edit product files inside temporary installation copies.
 
@@ -12,7 +12,7 @@ Neither test file imports or calls `unittest.mock`, `patch`, `Mock`, or `monkeyp
 
 `test_runtime_inputs.py:100–123` requires the target interpreter, native artifacts, four archives, and the recorded oracle. Lines `:152–234` make a temporary release copy, prepare real source archives through the product CLI, copy the supplied native artifacts, and invoke the product CLI to create the build receipt. These are working copies of real inputs; they do not contain replacement servers or functions.
 
-`tests/data/recorded-r3.json:3` identifies its configuration values as neutralized values from an independently recorded live invocation, captured before release generation and containing no request data. `test_runtime_inputs.py:122–132, 287–313` validates the oracle's structure and size, then compares the actual CLI result with it. The expected values are not read from the launcher result under test.
+`tests/data/recorded-k22.json:3` identifies its configuration values as the preserved independent r3 record plus explicit original K22 settings and the additional checkpoint-source marker, containing no request data. The r3 oracle remains unchanged. `test_runtime_inputs.py:122–132, 287–313` validates the oracle's structure and size, then compares the actual CLI result with it. The expected values are not read from the launcher result under test.
 
 ## Inventory of the 18 Methods
 
@@ -44,3 +44,7 @@ These methods check launch configuration, the build receipt, and source pins. Th
 ## Revision 2.1 additions
 
 The existing lock lifecycle method also uses real owned run directories and actual valid/dangling symlinks; run_path must reject both before resolution. The DIR producer mutant now updates the copied resolver pin and invokes the genuine build receipt producer after removing its copied receipt. This deliberate mutant rebinding reaches the independent configuration oracle without replacing a function or hand-writing a receipt. The suite still has 18 methods. Earlier line references are from revision 2; the added bodies shift later test lines.
+
+## K22 validation
+
+The K22 oracle contains 93 expected environment entries plus the permitted port setting and 74 command arguments. The environment filter additionally includes A1_SOURCE; comparisons are not relaxed. All 18 methods passed on WSL with the pinned real archives, genuine CPython 3.12.11, the historical K22 native ELF and genuine row-store library. These checks establish offline preparation, source/artifact binding and configuration resolution only. New native compilation and positive service paths remain untested.

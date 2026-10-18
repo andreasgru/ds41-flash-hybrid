@@ -1,0 +1,1823 @@
+Origin: K22 source snapshot, neutral extension names and English diagnostics
+Purpose: Reproduce the K22 extension from the pinned r3 source baseline
+License: Apache-2.0; preserve upstream notices
+
+diff -ruN a/kt-kernel/CMakeLists.txt b/kt-kernel/CMakeLists.txt
+--- a/kt-kernel/CMakeLists.txt	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/CMakeLists.txt	2026-10-18 12:44:34.826173952 +0200
+@@ -841,6 +841,8 @@
+         target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cudart)
+         message(STATUS "CUDA runtime: dynamic")
+     endif()
++    # Callback-free stream synchronization: cuStreamWriteValue32 / cuStreamWaitValue32 live in libcuda.
++    target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cuda_driver)
+ endif()
+ if(KTRANSFORMERS_USE_ROCM)
+     add_compile_definitions(USE_HIP=1)
+diff -ruN a/kt-kernel/cpu_backend/k2eplus_env.h b/kt-kernel/cpu_backend/k2eplus_env.h
+--- a/kt-kernel/cpu_backend/k2eplus_env.h	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/cpu_backend/k2eplus_env.h	2026-10-18 12:44:34.826834005 +0200
+@@ -0,0 +1,61 @@
++/**
++ * CPU expert optimization switches reorganize work without changing the arithmetic
++ * (outputs are bit-identical to the baseline KERN path).
++ *   KT_DS41_MU_K2EPLUS=1            all stages on (unset / 0 = legacy code paths, unchanged)
++ *   KT_DS41_MU_K2EPLUS_STAGES=<hex> diagnostics only: subset of stages (default: all)
++ * Stages (bits): 0 K6 (prefill activation permuted once per expert), 1 decode input quantized once per layer/part,
++ *   2 bs<10 prefill preparation in pool jobs, 3 SwiGLU/Q8 in the gate/up epilogue, 4 balanced tasks + down by
++ *   output rows with the weighted sum, 5 worker pool (no mutex/notify for spinning workers, _mm_pause, rare clock
++ *   reads), 6 TP merge inside the parts (last finisher of a block merges), 7 the decode scheme also for the
++ *   bs 2..9 path (forward_prefill with qlen < 10: gate/up epilogue, balanced tasks, down by rows + weighted sum).
++ * Balanced jobs use guided task sizes (KT_DS41_MU_K2EPLUS_GUIDED=0 restores equal splitting).
++ * Read once per process. No dependencies, usable from cpu_backend and operators.
++ **/
++#ifndef CPUINFER_K2EPLUS_ENV_H
++#define CPUINFER_K2EPLUS_ENV_H
++
++#include <atomic>
++#include <cstdlib>
++
++namespace k2p {
++
++enum : unsigned {
++  K6 = 1u << 0,
++  Q8ONCE = 1u << 1,
++  BSPREP = 1u << 2,
++  EPI = 1u << 3,
++  BAL = 1u << 4,
++  POOL = 1u << 5,
++  MERGE = 1u << 6,
++  BSFUSE = 1u << 7,
++  ALL = 0xFFu,
++};
++
++inline unsigned stages() {
++  static const unsigned s = [] {
++    const char* e = std::getenv("KT_DS41_MU_K2EPLUS");
++    if (e == nullptr || *e == 0 || std::atoi(e) == 0) return 0u;
++    const char* m = std::getenv("KT_DS41_MU_K2EPLUS_STAGES");
++    const unsigned v = (m != nullptr && *m != 0) ? (unsigned)std::strtoul(m, nullptr, 0) : (unsigned)ALL;  // hex ok
++    return v & (unsigned)ALL;
++  }();
++  return s;
++}
++
++inline bool on(unsigned bit) { return (stages() & bit) != 0; }
++
++// Stage 6 (MERGE): TP merge done inside the parts. Every part publishes the output rows it has finished (its fp32
++// weighted sum in y[part]); per (token, block) a counter collects the rows of ALL parts, and the thread that completes
++// a block writes out = bf16(y0 + y1 + ...) for it (same fp32 adds in part order and same bf16 rounding as
++// merge_results). Blocks nobody completed (a part took a legacy path) are covered by the legacy merge afterwards.
++struct MergeCtx {
++  void* output = nullptr;   // bf16 [qlen][hidden]
++  float* y[8] = {};         // per part fp32 [qlen][hidden]
++  int tp_count = 0, hidden = 0, qlen = 0, block = 0, nblk = 0;
++  std::atomic<int>* cnt = nullptr;  // [qlen][nblk]
++  std::atomic<int> merged{0};       // completed blocks
++};
++
++}  // namespace k2p
++
++#endif  // CPUINFER_K2EPLUS_ENV_H
+diff -ruN a/kt-kernel/cpu_backend/worker_pool.cpp b/kt-kernel/cpu_backend/worker_pool.cpp
+--- a/kt-kernel/cpu_backend/worker_pool.cpp	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/cpu_backend/worker_pool.cpp	2026-10-18 12:44:34.826673522 +0200
+@@ -11,6 +11,7 @@
+ #include "worker_pool.h"
+ 
+ #include <hwloc/bitmap.h>
++#include <immintrin.h>
+ #include <numa.h>
+ #include <numaif.h>
+ 
+@@ -21,10 +22,12 @@
+ #include <stdexcept>
+ 
+ #include "hwloc.h"
++#include "k2eplus_env.h"
+ 
+ thread_local int WorkerPool::thread_local_id = -1;
+ 
+ InNumaPool::InNumaPool(int max_thread_num) {
++  k2p_pool = k2p::on(k2p::POOL);
+   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
+   total_worker_count = max_thread_num;
+   set_restricted_worker_count(total_worker_count);
+@@ -40,6 +43,7 @@
+ 
+ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
+   printf("===========In NumaPool============\n");
++  k2p_pool = k2p::on(k2p::POOL);
+   hwloc_topology_t topology;
+   hwloc_obj_t numa_obj, core_obj;
+   hwloc_bitmap_t cpuset;
+@@ -116,10 +120,16 @@
+ void InNumaPool::set_restricted_worker_count(int count) { restricted_worker_count = count; }
+ 
+ void InNumaPool::wait() {
++  if (k2p_pool) {
++    for (int i = 0; i < worker_count; i++) {
++      while (thread_state_[i].status.load(std::memory_order_acquire) == ThreadStatus::WORKING) _mm_pause();
++    }
++  } else {
+   for (int i = 0; i < worker_count; i++) {
+     while (thread_state_[i].status.load(std::memory_order_acquire) == ThreadStatus::WORKING) {
+     }
+   }
++  }
+ 
+ #ifdef PROFILE_BALANCE
+   size_t max_time = 0;
+@@ -155,6 +165,18 @@
+   worker_count = std::min(restricted_worker_count, task_num);
+   curr_.store(0, std::memory_order_release);
+   end_ = task_num;
++  if (k2p_pool) {
++    // Spinning workers see the status store; only a worker that (may) block on its cv gets mutex + notify.
++    // seq_cst store/load here and in the worker's sleep path: either we see sleeping = 1 or it sees WORKING.
++    thread_state_[0].status.store(ThreadStatus::WORKING, std::memory_order_seq_cst);
++    for (int i = 1; i < worker_count; i++) thread_state_[i].status.store(ThreadStatus::WORKING, std::memory_order_seq_cst);
++    for (int i = 1; i < worker_count; i++) {
++      if (thread_state_[i].sleeping.load(std::memory_order_seq_cst)) {
++        { std::lock_guard<std::mutex> lock(thread_state_[i].mutex); }
++        thread_state_[i].cv.notify_one();
++      }
++    }
++  } else {
+   for (int i = 0; i < worker_count; i++) {
+     {
+       std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
+@@ -162,6 +184,7 @@
+     }
+     thread_state_[i].cv.notify_one();
+   }
++  }
+   WorkerPool::thread_local_id = 0;
+   process_tasks(0);
+ }
+@@ -215,6 +238,31 @@
+   }
+   auto start = std::chrono::high_resolution_clock::now();
+   WorkerPool::thread_local_id = thread_id;  // 设置线程本地变量
++  if (k2p_pool) {
++    ThreadState& ts = thread_state_[thread_id];
++    unsigned spins = 0;
++    while (true) {
++      ThreadStatus status = ts.status.load(std::memory_order_acquire);
++      if (status == ThreadStatus::WORKING) {
++        process_tasks(thread_id);
++        start = std::chrono::high_resolution_clock::now();
++        spins = 0;
++      } else if (status == ThreadStatus::WAITING) {
++        _mm_pause();
++        if ((++spins & 255u) != 0) continue;
++        auto now = std::chrono::high_resolution_clock::now();
++        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() > 50) {
++          std::unique_lock<std::mutex> lock(ts.mutex);
++          ts.sleeping.store(1, std::memory_order_seq_cst);
++          while (ts.status.load(std::memory_order_seq_cst) == ThreadStatus::WAITING) ts.cv.wait(lock);
++          ts.sleeping.store(0, std::memory_order_relaxed);
++          start = std::chrono::high_resolution_clock::now();
++        }
++      } else if (status == ThreadStatus::EXIT) {
++        return;
++      }
++    }
++  }
+   while (true) {
+     ThreadStatus status = thread_state_[thread_id].status.load(std::memory_order_acquire);
+     if (status == ThreadStatus::WORKING) {
+@@ -249,6 +297,7 @@
+ }
+ 
+ void NumaJobDistributor::init(std::vector<int> numa_ids) {
++  this->k2p_pool = k2p::on(k2p::POOL);
+   this->numa_count = numa_ids.size();
+   this->ready_bar = std::unique_ptr<std::barrier<>>(new std::barrier<>(numa_count + 1));
+   this->numa_ids = numa_ids;
+@@ -256,6 +305,7 @@
+     status.push_back(nullptr);
+     mutexes.push_back(std::make_unique<std::mutex>());
+     cvs.push_back(std::make_unique<std::condition_variable>());
++    sleeping.push_back(std::make_unique<std::atomic<int>>(0));
+   }
+ 
+   workers.resize(numa_count);
+@@ -272,6 +322,7 @@
+   hwloc_topology_init(&topology);
+   hwloc_topology_load(topology);
+ 
++  this->k2p_pool = k2p::on(k2p::POOL);
+   this->numa_count = numa_ids.size();
+   this->ready_bar = std::unique_ptr<std::barrier<>>(new std::barrier<>(numa_count + 1));
+   this->numa_ids = numa_ids;
+@@ -279,6 +330,7 @@
+     status.push_back(nullptr);
+     mutexes.push_back(std::make_unique<std::mutex>());
+     cvs.push_back(std::make_unique<std::condition_variable>());
++    sleeping.push_back(std::make_unique<std::atomic<int>>(0));
+   }
+ 
+   workers.resize(numa_count);
+@@ -368,6 +420,19 @@
+ #else
+ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
+   this->compute_func = compute_func;
++  if (k2p_pool) {  // Worker-pool optimization: see InNumaPool::do_work_stealing_job_async
++    for (int i = 0; i < numa_count; i++) status[i]->store(ThreadStatus::WORKING, std::memory_order_seq_cst);
++    for (int i = 0; i < numa_count; i++) {
++      if (sleeping[i]->load(std::memory_order_seq_cst)) {
++        { std::lock_guard<std::mutex> lock(*mutexes[i]); }
++        cvs[i]->notify_one();
++      }
++    }
++    for (int i = 0; i < numa_count; i++) {
++      while (status[i]->load(std::memory_order_acquire) == ThreadStatus::WORKING) _mm_pause();
++    }
++    return;
++  }
+   for (int i = 0; i < numa_count; i++) {
+     {
+       std::lock_guard<std::mutex> lock(*mutexes[i]);
+@@ -388,6 +453,31 @@
+   status[numa_id] =
+       std::move(std::unique_ptr<std::atomic<ThreadStatus>>(new std::atomic<ThreadStatus>(ThreadStatus::WAITING)));
+   ready_bar->arrive_and_wait();
++  if (k2p_pool) {  // Worker-pool optimization: pause in the spin, clock every 256 spins, sleep flag for do_numa_job
++    unsigned spins = 0;
++    while (true) {
++      auto stat = status[numa_id]->load(std::memory_order_acquire);
++      if (stat == ThreadStatus::WORKING) {
++        compute_func(numa_id);
++        status[numa_id]->store(ThreadStatus::WAITING, std::memory_order_release);
++        start = std::chrono::high_resolution_clock::now();
++        spins = 0;
++      } else if (stat == ThreadStatus::WAITING) {
++        _mm_pause();
++        if ((++spins & 255u) != 0) continue;
++        auto now = std::chrono::high_resolution_clock::now();
++        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() > 50) {
++          std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
++          sleeping[numa_id]->store(1, std::memory_order_seq_cst);
++          while (status[numa_id]->load(std::memory_order_seq_cst) == ThreadStatus::WAITING) cvs[numa_id]->wait(lock);
++          sleeping[numa_id]->store(0, std::memory_order_relaxed);
++          start = std::chrono::high_resolution_clock::now();
++        }
++      } else if (stat == ThreadStatus::EXIT) {
++        return;
++      }
++    }
++  }
+   while (true) {
+     auto stat = status[numa_id]->load(std::memory_order_acquire);
+     if (stat == ThreadStatus::WORKING) {
+diff -ruN a/kt-kernel/cpu_backend/worker_pool.h b/kt-kernel/cpu_backend/worker_pool.h
+--- a/kt-kernel/cpu_backend/worker_pool.h	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/cpu_backend/worker_pool.h	2026-10-18 12:44:34.827241634 +0200
+@@ -62,6 +62,7 @@
+ 
+ struct alignas(64) ThreadState {
+   std::atomic<ThreadStatus> status;
++  std::atomic<int> sleeping{0};  // Worker-pool optimization: worker blocks (or is about to block) on cv
+   std::mutex mutex;
+   std::condition_variable cv;
+ #ifdef PROFILE_BALANCE
+@@ -83,6 +84,9 @@
+   void do_work_stealing_job(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
+   void do_work_stealing_job(int, std::function<void(int)>);
+ 
++  // CPU expert optimization: threads a job can use (caller + workers), for balanced task counts
++  int k2p_worker_count() const { return restricted_worker_count; }
++
+  private:
+   int worker_count;
+   int total_worker_count;
+@@ -90,6 +94,10 @@
+   std::unique_ptr<ThreadState[]> thread_state_;  // [thread_num]
+   std::vector<std::thread> workers_;
+ 
++  // Worker-pool optimization (KT_DS41_MU_K2EPLUS stage 5, read at construction): no mutex/notify for spinning workers, _mm_pause
++  // in every spin, clock read only every 256 spins. Scheduling (dynamic fetch_add) and results are unchanged.
++  bool k2p_pool = false;
++
+   // changed ever time called do_work_stealing_job_async
+   int restricted_worker_count;
+   std::function<void(int)> init_func_;
+@@ -123,6 +131,8 @@
+   std::vector<std::unique_ptr<std::atomic<ThreadStatus>>> status;
+   std::vector<std::unique_ptr<std::mutex>> mutexes;
+   std::vector<std::unique_ptr<std::condition_variable>> cvs;
++  std::vector<std::unique_ptr<std::atomic<int>>> sleeping;  // Worker-pool optimization
++  bool k2p_pool = false;
+   std::function<void(int)> compute_func;
+   std::vector<std::thread> workers;
+ 
+diff -ruN a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+--- a/kt-kernel/ext_bindings.cpp	2026-10-18 11:53:23.526420698 +0200
++++ b/kt-kernel/ext_bindings.cpp	2026-10-18 12:44:34.826368496 +0200
+@@ -471,6 +471,16 @@
+       .def("load_weights", &MoeClass::load_weights)
+       .def("forward", &MoeClass::forward_binding);
+ 
++  // KT_EXPERT_SHM=1 arenas (MXFP4 AVX2 TP_MOE only): per TP part [(fd, size, stride)] x 6, and the layout as dict.
++  if constexpr (requires { &MoeClass::expert_arena_infos; }) {
++    moe_cls.def("expert_arena_infos", &MoeClass::expert_arena_infos);
++  }
++  if constexpr (requires { &MoeClass::expert_arena_layout_json; }) {
++    moe_cls.def("expert_arena_layout", [](const MoeClass& m) {
++      return py::module_::import("json").attr("loads")(m.expert_arena_layout_json());
++    });
++  }
++
+   // Bind write_weight_scale_to_buffer_task for MoE types that support it
+   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
+   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
+diff -ruN a/kt-kernel/operators/avx2/moe_base.hpp b/kt-kernel/operators/avx2/moe_base.hpp
+--- a/kt-kernel/operators/avx2/moe_base.hpp	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/operators/avx2/moe_base.hpp	2026-10-18 12:44:34.828532060 +0200
+@@ -24,9 +24,13 @@
+ #include <cstring>
+ #include <memory>
+ #include <string>
++#include <sys/mman.h>
++#include <tuple>
++#include <unistd.h>
+ #include <utility>
+ #include <vector>
+ 
++#include "../../cpu_backend/k2eplus_env.h"  // CPU expert optimization (KT_DS41_MU_K2EPLUS), only for backends with Derived::kK2P
+ #include "../../cpu_backend/shared_mem_buffer.h"
+ #include "../../cpu_backend/worker_pool.h"
+ #include "../common.hpp"
+@@ -64,6 +68,72 @@
+ 
+   std::vector<void*> owned_aligned_allocs_;
+ 
++  // KT_EXPERT_SHM=1 (ds41-multi-user, arena build): the packed weights and the fp32 group scales of every CPU expert live
++  // in memfd-backed shared mappings, one memfd per projection (gate, up, down) and kind (weights, scales), expert
++  // i at base + i * stride, so the A1 stager (same process) can read the resident copy instead of the checkpoint.
++  // Env KT_EXPERT_SHM unset or != "1": unchanged aligned_alloc path (bit-for-bit the old behavior).
++  // Deviations from the 09-24 arena patch (kt-mxfp4-arena-and-upfirst-combined.patch): no madvise(MADV_HUGEPAGE)
++  // (same 4 KB pages as the standard), MFD_CLOEXEC, only backends with a scale-only BufferB (MXFP4) are arena-backed.
++  struct ExpertArena {
++    int fd = -1;
++    uint8_t* base = nullptr;
++    size_t size = 0, stride = 0;
++  };
++  std::vector<ExpertArena> expert_arenas_;
++  static bool expert_shm_enabled() {
++    static const bool on = getenv("KT_EXPERT_SHM") != nullptr && getenv("KT_EXPERT_SHM")[0] == '1';
++    return on;
++  }
++  static ExpertArena make_expert_arena(size_t block, size_t count, const char* name) {
++    ExpertArena a;
++    a.stride = (block + 63) & ~63ULL;
++    a.size = a.stride * count;
++    a.fd = memfd_create(name, MFD_CLOEXEC);
++    if (a.fd < 0) throw std::runtime_error("KT_EXPERT_SHM: memfd_create failed for expert arena");
++    if (ftruncate(a.fd, (off_t)a.size) != 0) {
++      close(a.fd);
++      throw std::runtime_error("KT_EXPERT_SHM: ftruncate failed for expert arena");
++    }
++    void* m = mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
++    if (m == MAP_FAILED) {
++      close(a.fd);
++      throw std::runtime_error("KT_EXPERT_SHM: mmap failed for expert arena");
++    }
++    a.base = (uint8_t*)m;
++    return a;
++  }
++  static void free_expert_arena(ExpertArena& a) {
++    if (a.base) munmap(a.base, a.size);
++    if (a.fd >= 0) close(a.fd);
++    a.base = nullptr;
++    a.fd = -1;
++  }
++
++  // Parallel batch preparation: token of each gathered input row (flat, same offsets as m_local_input_ptr_)
++  std::vector<int> k2p_tok_;
++  // In-part TP merge: set by TP_MOE for the current call only (nullptr = legacy merge on the caller)
++  k2p::MergeCtx* k2p_mctx_ = nullptr;
++
++  // Rows [r0, r1) of token `tok` are final in y[tp_part_idx]: count them per block; the thread that completes a block
++  // (all parts) writes the merged bf16 output of that block exactly like merge_results.
++  void k2p_publish(int tok, int r0, int r1) {
++    k2p::MergeCtx* c = k2p_mctx_;
++    if (c == nullptr) return;
++    const int target = c->tp_count * c->block;
++    for (int b = r0 / c->block; b <= (r1 - 1) / c->block; b++) {
++      const int covered = std::min(r1, (b + 1) * c->block) - std::max(r0, b * c->block);
++      if (c->cnt[(size_t)tok * c->nblk + b].fetch_add(covered, std::memory_order_acq_rel) + covered != target) continue;
++      const size_t base = (size_t)tok * c->hidden;
++      ggml_bf16_t* out = (ggml_bf16_t*)c->output + base;
++      for (int e = b * c->block; e < (b + 1) * c->block; e += 8) {
++        __m256 acc = _mm256_load_ps(c->y[0] + base + e);
++        for (int i = 1; i < c->tp_count; i++) acc = _mm256_add_ps(acc, _mm256_load_ps(c->y[i] + base + e));
++        avx2::store_fp32_to_bf16(out + e, acc);
++      }
++      c->merged.fetch_add(1, std::memory_order_acq_rel);
++    }
++  }
++
+   size_t pool_count_ = 0;
+   size_t gate_up_ba_pool_bytes_ = 0;
+   size_t gate_bc_pool_bytes_ = 0;
+@@ -101,6 +171,7 @@
+     mem_requests.append_pointer(&m_local_down_output_, sizeof(ggml_bf16_t) * config_.num_experts_per_tok *
+                                                            config_.max_len * config_.hidden_size);
+ 
++    k2p_tok_.resize((size_t)config_.max_len * config_.num_experts_per_tok);
+     m_local_pos_.resize(config_.max_len);
+     for (int i = 0; i < config_.max_len; i++) {
+       m_local_pos_[i].resize(config_.num_experts_per_tok);
+@@ -112,6 +183,20 @@
+     m_local_up_output_ptr_.resize(config_.expert_num);
+     m_local_down_output_ptr_.resize(config_.expert_num);
+ 
++    // KT_EXPERT_SHM=1: per-expert loaders keep the packed weights in the TP class's per-part arenas, so the base
++    // block only ever holds the fp32 group scales; allocate scale-only arenas and scale-only BufferBs.
++    const bool use_expert_shm = expert_shm_enabled() && kHasScaleOnlyBufferB;
++    if constexpr (kHasScaleOnlyBufferB) {
++      if (use_expert_shm) {
++        expert_arenas_.push_back(make_expert_arena(
++            buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_gate_s"));
++        expert_arenas_.push_back(make_expert_arena(
++            buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_up_s"));
++        expert_arenas_.push_back(make_expert_arena(
++            buffer_b_scale_size(config_.hidden_size, config_.intermediate_size), config_.expert_num, "kt_down_s"));
++      }
++    }
++
+     for (size_t i = 0; i < config_.expert_num; i++) {
+       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
+       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
+@@ -119,6 +204,16 @@
+       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
+       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
+ 
++      if (use_expert_shm) {
++        gate_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size,
++                                                    expert_arenas_[0].base + i * expert_arenas_[0].stride));
++        up_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size,
++                                                  expert_arenas_[1].base + i * expert_arenas_[1].stride));
++        down_bb_.push_back(make_buffer_b_scale_only(config_.hidden_size, config_.intermediate_size,
++                                                    expert_arenas_[2].base + i * expert_arenas_[2].stride));
++        continue;
++      }
++
+       void* gate_bb_ptr = std::aligned_alloc(
+           64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+       if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
+@@ -158,6 +253,15 @@
+   virtual ~AVX2_MOE_BASE() {
+     shared_mem_buffer_numa.dealloc(tp_part_idx, this);
+     for (void* p : owned_aligned_allocs_) std::free(p);
++    for (auto& a : expert_arenas_) free_expert_arena(a);
++  }
++
++  // (fd, size, stride) of the gate, up and down SCALE arenas (fp32 group scales); empty unless KT_EXPERT_SHM=1.
++  // The TP class prepends the three weight arenas (see TP_MOE<AVX2_MXFP4_MOE_TP>::expert_arena_infos).
++  std::vector<std::tuple<int, size_t, size_t>> expert_arena_info() const {
++    std::vector<std::tuple<int, size_t, size_t>> out;
++    for (auto& a : expert_arenas_) out.emplace_back(a.fd, a.size, a.stride);
++    return out;
+   }
+ 
+   void warm_up() {
+@@ -270,6 +374,33 @@
+       }
+     };
+ 
++    // Parallel batch preparation: for qlen < 10 (bs 2..4 decode) the preparation below ran serially on the caller.
++    // With the switch: gather + from_mat per expert in ONE pool job (same bytes in m_local_input), SwiGLU and the
++    // weighted sum as pool jobs. Only thread placement changes, never the arithmetic.
++    const bool k2p_bs = k2p_capable() && qlen < 10 && activated_expert > 0 && k2p::on(k2p::BSPREP);
++    if (k2p_bs) {
++      int* tok = k2p_tok_.data();
++      for (int i = 0; i < qlen; i++) {
++        for (int j = 0; j < k; j++) {
++          if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
++          const int64_t e = expert_ids[i * k + j];
++          const size_t off = (size_t)(m_local_input_ptr_[e] - m_local_input_) / config_.hidden_size;
++          tok[off + m_local_pos_[i][j]] = i;
++        }
++      }
++      pool->do_work_stealing_job(
++          activated_expert, nullptr,
++          [this, tok, input](int task_id) {
++            const int expert_idx = m_expert_id_map_[task_id];
++            const size_t off = (size_t)(m_local_input_ptr_[expert_idx] - m_local_input_) / config_.hidden_size;
++            for (int p = 0; p < m_local_num_[expert_idx]; p++)
++              memcpy(m_local_input_ptr_[expert_idx] + (size_t)p * config_.hidden_size,
++                     (const ggml_bf16_t*)input + (size_t)tok[off + p] * config_.hidden_size,
++                     sizeof(ggml_bf16_t) * config_.hidden_size);
++            gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
++          },
++          nullptr);
++    } else {
+     // Copy input to per-expert buffers
+     direct_or_pool(qlen, [&](int i) {
+       for (int j = 0; j < k; j++) {
+@@ -284,6 +415,16 @@
+       int expert_idx = m_expert_id_map_[task_id];
+       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+     });
++    }
++
++    // Batched decode fusion (stage 7): bs 2..9 with the decode scheme in the derived class (buffers as assigned above)
++    if constexpr (requires(Derived& d, int q, int kk, const int64_t* ii, const float* ww, void* o, int a) {
++                    d.k2p_bs(q, kk, ii, ww, o, a);
++                  }) {
++      if (qlen < 10 && activated_expert > 0 && k2p::on(k2p::BSFUSE)) {
++        if (derived()->k2p_bs(qlen, k, expert_ids, weights, output, activated_expert)) return;
++      }
++    }
+ 
+     if constexpr (has_fused_prefill()) {
+       if (activated_expert > 0) run_fused_prefill(activated_expert, qlen);
+@@ -307,7 +448,7 @@
+           nullptr);
+ 
+       // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
+-      apply_activation(activated_expert, nth, qlen);
++      apply_activation(activated_expert, nth, qlen, k2p_bs);
+ 
+       // Pack activation output into BufferA for down projection
+       pool->do_work_stealing_job(
+@@ -331,6 +472,39 @@
+           nullptr);
+     }
+ 
++    // Parallel batch preparation: weighted sum split into qlen x kWsChunks column blocks (multiples of 16) instead of
++    // qlen tasks; per element the same FMA chain over j as below.
++    constexpr int kWsChunks = 8;
++    if (k2p_bs && config_.hidden_size % (16 * kWsChunks) == 0) {
++      const int cw = config_.hidden_size / kWsChunks;
++      pool->do_work_stealing_job(
++          qlen * kWsChunks, nullptr,
++          [this, output, k, expert_ids, weights, cw](int t) {
++            const int i = t / kWsChunks;
++            const int e0 = (t % kWsChunks) * cw;
++            for (int e = e0; e < e0 + cw; e += 16) {
++              __m256 x0 = _mm256_setzero_ps();
++              __m256 x1 = _mm256_setzero_ps();
++              for (int j = 0; j < k; j++) {
++                if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
++                __m256 weight = _mm256_set1_ps(weights[i * k + j]);
++                __m256 d0, d1;
++                avx2::load_16xbf16_to_2x8xfp32(
++                    m_local_down_output_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size + e, &d0,
++                    &d1);
++                x0 = _mm256_fmadd_ps(d0, weight, x0);
++                x1 = _mm256_fmadd_ps(d1, weight, x1);
++              }
++              auto f32out = (__m256*)((float*)output + i * config_.hidden_size + e);
++              f32out[0] = x0;
++              f32out[1] = x1;
++            }
++            k2p_publish(i, e0, e0 + cw);
++          },
++          nullptr);
++      return;
++    }
++
+     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
+     pool->do_work_stealing_job(
+         qlen, nullptr,
+@@ -357,6 +531,12 @@
+   }
+ 
+   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
++    // CPU expert optimization (stages EPI/BAL): reorganised decode in the derived class; false = not applicable -> legacy below
++    if constexpr (requires(Derived& d, int kk, const int64_t* ii, const float* ww, const void* in, void* o) {
++                    d.k2p_decode(kk, ii, ww, in, o);
++                  }) {
++      if (derived()->k2p_decode(k, expert_ids, weights, input, output)) return;
++    }
+     int qlen = 1;
+     auto pool = config_.pool->get_subpool(tp_part_idx);
+ 
+@@ -417,9 +597,18 @@
+ 
+     // Pack input into BufferA for each activated expert
+     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
++    // Shared decode input preparation: the decode input is the same for every expert -> prepare it once (first expert) and let
++    // the other experts' BufferA refer to the very same bytes (same q8 / permuted fp32 / bf16 values).
++    const bool k2p_once = k2p_capable() && k2p::on(k2p::Q8ONCE);
+     for (int i = 0; i < activated_expert; i++) {
+       auto expert_idx = m_expert_id_map_[i];
+       size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
++      if constexpr (k2p_capable()) {
++        if (k2p_once && i > 0) {
++          *gate_up_ba_[expert_idx] = *gate_up_ba_[m_expert_id_map_[0]];
++          continue;
++        }
++      }
+       gate_up_ba_[expert_idx]->max_m = max_m;
+       gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
+       gate_up_ba_pool_ptr =
+@@ -500,6 +689,11 @@
+   Derived* derived() { return static_cast<Derived*>(this); }
+   const Derived* derived_const() const { return static_cast<const Derived*>(this); }
+ 
++  // CPU expert optimization: only backends that opt in (Derived::kK2P, today AVX2_MXFP4_MOE_TP) take the optimized paths.
++  static constexpr bool k2p_capable() {
++    return requires { Derived::kK2P; };
++  }
++
+   static constexpr bool has_fused_prefill() {
+     return requires(Derived& backend) { backend.fused_prefill_experts(0, 0); };
+   }
+@@ -537,12 +731,33 @@
+   std::shared_ptr<typename T::BufferB> make_buffer_b(size_t n, size_t k, void* data) const {
+     return derived_const()->make_buffer_b_impl(n, k, data);
+   }
++  // Backends whose BufferB can be scale-only (MXFP4) can keep the packed weights elsewhere; the KT_EXPERT_SHM
++  // arenas rely on that. All other backends ignore KT_EXPERT_SHM.
++  static constexpr bool kHasScaleOnlyBufferB =
++      requires(const Derived& d) {
++        T::BufferB::required_size_scale_only(size_t{}, size_t{}, int{});
++        d.make_buffer_b_scale_only_impl(size_t{}, size_t{}, (void*)nullptr);
++      };
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only(size_t n, size_t k, void* scales) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return derived_const()->make_buffer_b_scale_only_impl(n, k, scales);
++    } else {
++      throw std::runtime_error("KT_EXPERT_SHM needs a backend with scale-only BufferB");
++    }
++  }
++  size_t buffer_b_scale_size(size_t n, size_t k) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size);
++    } else {
++      return 0;
++    }
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c(size_t m, size_t n, void* data) const {
+     return derived_const()->make_buffer_c_impl(m, n, data);
+   }
+ 
+   // SiLU activation — AVX2: process 8 BF16 elements at a time
+-  void apply_activation(int activated_expert, int nth, int qlen) {
++  void apply_activation(int activated_expert, int nth, int qlen, bool k2p_par = false) {
+     auto pool = config_.pool->get_subpool(tp_part_idx);
+     auto fn = [this, nth](int task_id) {
+       int expert_idx = m_expert_id_map_[task_id / nth];
+@@ -585,7 +800,7 @@
+ 
+     if (activated_expert == 0) return;
+ 
+-    if (qlen < 10) {
++    if (qlen < 10 && !k2p_par) {
+       for (int task_id = 0; task_id < nth * activated_expert; task_id++) fn(task_id);
+     } else {
+       pool->do_work_stealing_job(nth * activated_expert, nullptr, fn, nullptr);
+@@ -612,6 +827,45 @@
+     throw std::runtime_error("Not Implemented");
+   }
+ 
++  // In-part TP merge (stage 6): decode and bs < 10 only, not incremental; blocks of hidden/8 rows (multiple of 16)
++  k2p::MergeCtx k2p_ctx_;
++  std::vector<std::atomic<int>> k2p_cnt_ = std::vector<std::atomic<int>>(10 * 8);
++  bool k2p_merge_begin(int qlen, void* output, bool incremental) override {
++    auto& config = this->config;
++    if constexpr (!requires { Derived::kK2P; }) {
++      return false;
++    } else {
++      const int H = config.hidden_size;
++      if (incremental || qlen < 1 || qlen >= 10 || this->tp_count > 8 || H % 128 != 0 || !k2p::on(k2p::MERGE)) return false;
++      for (int i = 0; i < this->tp_count; i++)
++        if (this->tp_configs[i].hidden_size != H) return false;
++      k2p::MergeCtx& c = k2p_ctx_;
++      c.output = output;
++      c.tp_count = this->tp_count;
++      c.hidden = H;
++      c.qlen = qlen;
++      c.nblk = 8;
++      c.block = H / 8;
++      c.cnt = k2p_cnt_.data();
++      for (int i = 0; i < this->tp_count; i++) c.y[i] = this->local_output_numa[i];
++      for (int i = 0; i < qlen * c.nblk; i++) c.cnt[i].store(0, std::memory_order_relaxed);
++      c.merged.store(0, std::memory_order_relaxed);
++      for (int i = 0; i < this->tp_count; i++) this->tps[i]->k2p_mctx_ = &c;
++      return true;  // do_numa_job publishes these stores to the parts (seq_cst / release on the status flags)
++    }
++  }
++  bool k2p_merge_end(bool active) override {
++    if (!active) return false;
++    for (int i = 0; i < this->tp_count; i++) this->tps[i]->k2p_mctx_ = nullptr;
++    const bool all = k2p_ctx_.merged.load(std::memory_order_acquire) == k2p_ctx_.qlen * k2p_ctx_.nblk;
++#ifdef K2P_TRACE
++    static std::atomic<long> n_all{0}, n_fb{0};
++    const long a = all ? ++n_all : n_all.load(), f = all ? n_fb.load() : ++n_fb;
++    if (((a + f) & (a + f - 1)) == 0 || (k2p_ctx_.qlen > 1 && (a + f) % 60 == 0)) fprintf(stderr, "[K2P_TRACE] merge in parts: %ld, fallback legacy: %ld (qlen %d)\n", a, f, k2p_ctx_.qlen);
++#endif
++    return all;
++  }
++
+   void merge_results(int qlen, void* output, bool incremental) override {
+     auto& config = this->config;
+     auto& tp_count = this->tp_count;
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-decode-kernel.hpp b/kt-kernel/operators/avx2/mxfp4-decode-kernel.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-decode-kernel.hpp	1970-01-01 01:00:00.000000000 +0100
++++ b/kt-kernel/operators/avx2/mxfp4-decode-kernel.hpp	2026-10-18 12:44:34.828255375 +0200
+@@ -0,0 +1,269 @@
++/**
++ * @Description  : AVX2 MXFP4 exact decode GEMV variants for Zen 2
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Same contract as avx2kern::gemv_m<M, E8> (mxfp4-kernel.hpp): per (weight row, activation row) the arithmetic is
++ * IDENTICAL to the legacy single-row loop of gemm_mxfp4 (group size 32):
++ *   gacc = a0*w0; gacc = fma(a1,w1,gacc); gacc = fma(a2,w2,gacc); gacc = fma(a3,w3,gacc);
++ *   t[g & 1] = fma(gacc, scale_g, t[g & 1]);   result = hsum(t0 + t1)
++ * with the legacy column -> lane mapping (w0 = cols {0,2,4,6 | 1,3,5,7}, w1 = {8..14 | 9..15}, ...).
++ * Only HOW w0..w3 are produced and how memory is touched differs:
++ *   VAR bit 0 (SPLIT): nibble split with one broadcast load + vpsrlvd + vpand (2 FP ops instead of 4).
++ *   PFD > 0          : software prefetch of the weight stream PFD bytes ahead (prefetcht0, one per 64-byte line),
++ *                      e8m0 scales PFD/16 bytes ahead; rows are contiguous, so the prefetch runs into the next row.
++ * The values w0..w3 are bit-identical to the legacy decode for every input byte (checked exhaustively over all
++ * 256 byte values per position by dskern_selftest_decode()).
++ **/
++#ifndef CPUINFER_OPERATOR_AVX2_MXFP4_DSKERN_H
++#define CPUINFER_OPERATOR_AVX2_MXFP4_DSKERN_H
++
++#include <immintrin.h>
++
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "mxfp4-kernel.hpp"  // avx2kern::KConst, decode_group<0>, e8_table, kern_mode
++
++namespace dskern {
++
++// VAR bit 1 (MULADD): the four products a_i*w_i are EXACT in fp32 (bf16 activation: 8 significant bits; FP4 weight:
++// at most 2), so fma(a_i, w_i, acc) == round(acc + a_i*w_i) == add(acc, mul(a_i, w_i)). MULADD computes the four
++// products independently and chains three adds: same roundings in the same order, but a dependency chain of
++// mul(3) + 3 x add(3) instead of mul(3) + 3 x fma(5) cycles. Exactness needs |a| <= 2^125 (no product overflow)
++// and finite activations; act_safe() checks that once per activation buffer, callers fall back to VAR & ~MULADD.
++// VAR bit 2 (PFL2): software prefetch with _MM_HINT_T1 (into L2) instead of _MM_HINT_T0 (into L1).
++enum : int { SPLIT = 1, MULADD = 2, PFL2 = 4 };
++
++// true if every activation value is finite and |a| <= 2^125 (then |a*w| <= 6 * 2^125 < FLT_MAX: no overflow).
++static inline bool act_safe(const float* a, size_t n) {
++  const __m256 lim = _mm256_set1_ps(0x1p125f);
++  const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
++  __m256 bad = _mm256_setzero_ps();
++  size_t i = 0;
++  for (; i + 8 <= n; i += 8) {
++    const __m256 x = _mm256_and_ps(_mm256_loadu_ps(a + i), absm);
++    bad = _mm256_or_ps(bad, _mm256_cmp_ps(x, lim, _CMP_NLE_UQ));  // > lim, or NaN (unordered)
++  }
++  if (_mm256_movemask_ps(bad) != 0) return false;
++  for (; i < n; i++) {
++    const float x = a[i] < 0 ? -a[i] : a[i];
++    if (!(x <= 0x1p125f)) return false;
++  }
++  return true;
++}
++
++// Env switch, read once per process: KT_DS41_MU_DECODE_KERNEL=1 selects the exact decode GEMV for the KERN=1 m <= 3 path.
++// KT_DS41_MU_DECODE_PREFETCH overrides the prefetch distance (bytes, 0 = off; only values compiled below are accepted).
++static inline int env_int(const char* name, int dflt) {
++  const char* s = std::getenv(name);
++  return (s && *s) ? std::atoi(s) : dflt;
++}
++static inline int mode() {
++  static const int m = env_int("KT_DS41_MU_DECODE_KERNEL", 0);
++  return m;
++}
++// KT_DS41_MU_DECODE_PREFETCH: software prefetch distance in bytes for the exact decode GEMV; only 0, 1024, 2048, 4096 are compiled into the
++// package path. Any other value returns -1 (the caller refuses to start: fail closed, no silent fallback).
++static inline int pfd() {
++  static const int p = [] {
++    const int v = env_int("KT_DS41_MU_DECODE_PREFETCH", 0);
++    return (v == 0 || v == 1024 || v == 2048 || v == 4096) ? v : -1;
++  }();
++  return p;
++}
++
++// ---- Entry counter for the exact decode dispatch branch -----
++// count_entry() is called as the first statement of the decode branch in avx2::gemm_mxfp4 (mxfp4-moe.hpp). The counter is
++// a relaxed atomic add and does not participate in the arithmetic. Diagnostic output:
++//   * the first entry prints one line "DK_ENTRY_COUNT=<n>", every ENTRY_REPORT_EVERY entries another one,
++//   * an exit handler registered on the first entry prints the final count at the regular stop (process exit).
++// An absent line (or DK_ENTRY_COUNT=0) means the decode branch was never entered. A fallback to gemv_m
++// can preserve identical output bytes while leaving the entry counter at 0.
++static constexpr unsigned long long ENTRY_REPORT_EVERY = 4096;
++
++inline std::atomic<unsigned long long>& entry_counter() {
++  static std::atomic<unsigned long long> c{0};
++  return c;
++}
++
++inline void report_entries(const char* where) {
++  std::fprintf(stdout, "DK_ENTRY_COUNT=%llu final (%s)\n",
++               (unsigned long long)entry_counter().load(std::memory_order_relaxed), where);
++  std::fflush(stdout);
++}
++
++static inline void entry_exit_handler() { report_entries("regular stop"); }
++
++inline void count_entry() {
++  const unsigned long long n = entry_counter().fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n == 1 || (n % ENTRY_REPORT_EVERY) == 0) {
++    std::fprintf(stdout, "DK_ENTRY_COUNT=%llu (DK branch gemm_mxfp4, m<=2)\n", n);
++    std::fflush(stdout);
++  }
++  static const bool handler_set = (std::atexit(entry_exit_handler), true);
++  (void)handler_set;
++}
++
++struct DConst {
++  __m256i lutlo, luthi, nib, zero, shift;
++  DConst() {
++    lutlo = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)avx2kern::kLutLo));
++    luthi = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)avx2kern::kLutHi));
++    nib = _mm256_set1_epi8(0x0F);
++    zero = _mm256_setzero_si256();
++#if defined(DK_MUTANT) && DK_MUTANT == 1  // positive control only: lo/hi nibble halves swapped
++    shift = _mm256_setr_epi32(4, 4, 4, 4, 0, 0, 0, 0);
++#else
++    shift = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
++#endif
++  }
++};
++
++// Decode one 32-value group at p into w0..w3 with the legacy lane mapping.
++template <int VAR>
++static __attribute__((always_inline)) inline void decode(const uint8_t* p, const DConst& K, __m256& w0, __m256& w1,
++                                                          __m256& w2, __m256& w3) {
++  __m256i v;
++  if constexpr ((VAR & SPLIT) != 0) {
++    // [raw | raw] -> low lane unchanged, high lane >> 4 per dword; & 0x0F per byte = [lo nibbles | hi nibbles]
++    const __m256i r = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)p));
++    v = _mm256_and_si256(_mm256_srlv_epi32(r, K.shift), K.nib);
++  } else {
++    const __m128i raw = _mm_loadu_si128((const __m128i*)p);
++    const __m128i n128 = _mm256_castsi256_si128(K.nib);
++    const __m128i lo = _mm_and_si128(raw, n128);
++    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), n128);
++    v = _mm256_set_m128i(hi, lo);
++  }
++  const __m256i bl = _mm256_shuffle_epi8(K.lutlo, v);
++  const __m256i bh = _mm256_shuffle_epi8(K.luthi, v);
++  const __m256i ua = _mm256_unpacklo_epi8(bl, bh);
++  const __m256i ub = _mm256_unpackhi_epi8(bl, bh);
++  w0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(K.zero, ua));
++  w1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(K.zero, ua));
++  w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(K.zero, ub));
++  w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(K.zero, ub));
++}
++
++// M activation rows (fp32, legacy permuted, row stride ap_stride) against weight rows [n0, n1).
++// Scales: fp32 (E8 = false, dv = float*) or e8m0 bytes (E8 = true, dv = uint8_t*). c[mi * c_stride + ni].
++template <int M, bool E8, int VAR, int PFD>
++static void gemv(const float* __restrict ap, size_t ap_stride, const uint8_t* __restrict b, const void* __restrict dv,
++                 int k, int n0, int n1, float* __restrict c, size_t c_stride) {
++  static const DConst K;
++  const float* e8 = avx2kern::e8_table();
++  const int G = k / 32;
++  const size_t rb = (size_t)k / 2;
++  for (int ni = n0; ni < n1; ni++) {
++    const uint8_t* br = b + (size_t)ni * rb;
++    const float* sf = E8 ? nullptr : (const float*)dv + (size_t)ni * G;
++    const uint8_t* se = E8 ? (const uint8_t*)dv + (size_t)ni * G : nullptr;
++    __m256 t0[M], t1[M];
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) t0[mi] = t1[mi] = _mm256_setzero_ps();
++    auto step = [&](int g, __m256* tacc) __attribute__((always_inline)) {
++      if constexpr (PFD > 0) {
++        constexpr auto H = (VAR & PFL2) != 0 ? _MM_HINT_T1 : _MM_HINT_T0;
++        if ((g & 3) == 0) _mm_prefetch((const char*)(br + (size_t)g * 16 + PFD), H);
++        if constexpr (E8) {
++          if ((g & 63) == 0) _mm_prefetch((const char*)(se + g + PFD / 16), H);
++        } else {
++          if ((g & 15) == 0) _mm_prefetch((const char*)(sf + g + PFD / 16), H);
++        }
++      }
++      __m256 w0, w1, w2, w3;
++      decode<VAR>(br + (size_t)g * 16, K, w0, w1, w2, w3);
++      const __m256 sv = E8 ? _mm256_broadcast_ss(e8 + se[g]) : _mm256_broadcast_ss(sf + g);
++#pragma GCC unroll 4
++      for (int mi = 0; mi < M; mi++) {
++        const float* a = ap + mi * ap_stride + (size_t)g * 32;
++        // NOTE: swapping the first two terms is an EQUIVALENT change (a*w is exact for bf16 x FP4, so
++        // mul(a0,w0)+fma(a1,w1) == mul(a1,w1)+fma(a0,w0)); mutant 3 therefore swaps terms 3 and 4.
++        __m256 gacc;
++        if constexpr ((VAR & MULADD) != 0) {
++          __m256 p0 = _mm256_mul_ps(_mm256_loadu_ps(a), w0);
++          __m256 p1 = _mm256_mul_ps(_mm256_loadu_ps(a + 8), w1);
++          __m256 p2 = _mm256_mul_ps(_mm256_loadu_ps(a + 16), w2);
++          __m256 p3 = _mm256_mul_ps(_mm256_loadu_ps(a + 24), w3);
++          // pin the products: without this, -ffast-math contracts mul+add back into fma (same value, long chain)
++          __asm__("" : "+x"(p0), "+x"(p1), "+x"(p2), "+x"(p3));
++          // fixed order ((p0 + p1) + p2) + p3; the empty asm pins each partial sum against -ffast-math reassociation
++          gacc = _mm256_add_ps(p0, p1);
++          __asm__("" : "+x"(gacc));
++#if defined(DK_MUTANT) && DK_MUTANT == 3
++          gacc = _mm256_add_ps(gacc, p3);
++          __asm__("" : "+x"(gacc));
++          gacc = _mm256_add_ps(gacc, p2);
++#else
++          gacc = _mm256_add_ps(gacc, p2);
++          __asm__("" : "+x"(gacc));
++          gacc = _mm256_add_ps(gacc, p3);
++#endif
++          __asm__("" : "+x"(gacc));
++        } else {
++          gacc = _mm256_mul_ps(_mm256_loadu_ps(a), w0);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 8), w1, gacc);
++#if defined(DK_MUTANT) && DK_MUTANT == 3  // positive control only: third and fourth product in the other order
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 24), w3, gacc);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 16), w2, gacc);
++#else
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 16), w2, gacc);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(a + 24), w3, gacc);
++#endif
++        }
++        tacc[mi] = _mm256_fmadd_ps(gacc, sv, tacc[mi]);
++      }
++    };
++    int g = 0;
++#if defined(DK_MUTANT) && DK_MUTANT == 2  // positive control only: groups g % 4 == 3 into t0 instead of t1
++    // (a plain t0/t1 swap would be EQUIVALENT: the final t0 + t1 is commutative)
++    for (; g + 2 <= G; g += 2) {
++      step(g, t0);
++      step(g + 1, ((g + 1) & 3) == 3 ? t0 : t1);
++    }
++    if (g < G) step(g, t0);
++#else
++    for (; g + 2 <= G; g += 2) {
++      step(g, t0);
++      step(g + 1, t1);
++    }
++    if (g < G) step(g, t0);
++#endif
++#pragma GCC unroll 4
++    for (int mi = 0; mi < M; mi++) c[mi * c_stride + ni] = avx2::hsum_avx2(_mm256_add_ps(t0[mi], t1[mi]));
++  }
++}
++
++// Exhaustive check of the decode: every byte value at every one of the 16 positions, VAR vs legacy decode_group<0>.
++// Returns the number of differing 32-bit lanes (0 = identical).
++template <int VAR>
++static long selftest_decode() {
++  static const DConst K;
++  static const avx2kern::KConst L;
++  long bad = 0;
++  alignas(16) uint8_t buf[16];
++  for (int pos = 0; pos < 16; pos++) {
++    for (int val = 0; val < 256; val++) {
++      for (int i = 0; i < 16; i++) buf[i] = (uint8_t)((i * 37 + 11) & 0xFF);
++      buf[pos] = (uint8_t)val;
++      __m256 a0, a1, a2, a3, b0, b1, b2, b3;
++      decode<VAR>(buf, K, a0, a1, a2, a3);
++      avx2kern::decode_group<0>(buf, L, b0, b1, b2, b3);
++      const __m256 av[4] = {a0, a1, a2, a3}, bv[4] = {b0, b1, b2, b3};
++      for (int q = 0; q < 4; q++) {
++        alignas(32) uint32_t x[8], y[8];
++        _mm256_store_si256((__m256i*)x, _mm256_castps_si256(av[q]));
++        _mm256_store_si256((__m256i*)y, _mm256_castps_si256(bv[q]));
++        for (int l = 0; l < 8; l++) bad += x[l] != y[l];
++      }
++    }
++  }
++  return bad;
++}
++
++}  // namespace dskern
++
++#endif  // CPUINFER_OPERATOR_AVX2_MXFP4_DSKERN_H
+diff -ruN a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-18 11:53:23.526869708 +0200
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp	2026-10-18 12:44:34.827817996 +0200
+@@ -16,6 +16,7 @@
+ #include <tmmintrin.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <stdexcept>
+ #include <string>
+@@ -26,6 +27,8 @@
+ #include "avx2_bf16_utils.hpp"
+ #include "moe_base.hpp"
+ #include "mxfp4-kernel.hpp"  // AVX2 MXFP4 decode kernel and E8M0 scale paths
++#include "mxfp4-decode-kernel.hpp"  // Exact decode variant (KT_DS41_MU_DECODE_KERNEL): bit-identical decode variant for the KERN=1 m <= 2 path
++#include "../../cpu_backend/k2eplus_env.h"  // CPU expert optimization (KT_DS41_MU_K2EPLUS)
+ 
+ #include <atomic>
+ 
+@@ -194,10 +197,23 @@
+           perm_m = m;
+           return;
+         }
++        // Prefill activation preparation: 4 <= m < 16 (CPU prefill below the stream threshold) -> permuted FP32 copy once per
++        // expert, vectorized; the very same values in the same order as the per-task conversion in gemm_mxfp4.
++        if (perm != nullptr && m >= 4 && (k % 32) == 0 && k2p::on(k2p::K6)) {
++          for (int mi = m_start; mi < m_end; mi++)
++            avx2kern::permute_act_bf16(src + (size_t)mi * k, perm + (size_t)mi * k, (int)k);
++          perm_m = m;
++          return;
++        }
+         perm_m = 0;
+         return;
+       }
+       perm_m = m;
++      if ((k % 32) == 0 && k2p::on(k2p::K6)) {  // Prefill activation preparation: same values as the scalar loop below, vectorized
++        for (int mi = m_start; mi < m_end; mi++)
++          avx2kern::permute_act_bf16(src + (size_t)mi * k, perm + (size_t)mi * k, (int)k);
++        return;
++      }
+       const int groups = (int)(k / 32);
+       for (int mi = m_start; mi < m_end; mi++) {
+         const ggml_bf16_t* a_row = src + (size_t)mi * k;
+@@ -320,6 +336,29 @@
+     const bool e8 = b.e8 != nullptr;
+     const void* dv = e8 ? (const void*)b.e8 : (const void*)b.d;
+     const size_t as = (size_t)k;
++    // Exact decode variant (KT_DS41_MU_DECODE_KERNEL=1): same arithmetic per (row, activation) as avx2kern::gemv_m, only the
++    // nibble split is cheaper (vpsrlvd); measured on Zen 2 m=1 7,74 -> 7,21, m=2 10,71 -> 10,11 cycles per 32-group.
++    // m = 3 stays on gemv_m (the variant is slower there). Off (default): exactly the previous code path.
++    if (dskern::mode() >= 1 && m <= 2) {
++      // Record entry into this dispatch branch with a relaxed atomic increment; arithmetic is unchanged.
++      dskern::count_entry();
++      // KT_DS41_MU_DECODE_PREFETCH (0/1024/2048/4096 bytes) selects the software prefetch distance; validated in derived_init.
++#define DSK_CALL(PF)                                                                                                   \
++  switch (m * 2 + (e8 ? 1 : 0)) {                                                                                      \
++    case 2: dskern::gemv<1, false, dskern::SPLIT, PF>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break; \
++    case 3: dskern::gemv<1, true, dskern::SPLIT, PF>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;  \
++    case 4: dskern::gemv<2, false, dskern::SPLIT, PF>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break; \
++    default: dskern::gemv<2, true, dskern::SPLIT, PF>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break; \
++  }
++      switch (dskern::pfd()) {
++        case 1024: DSK_CALL(1024) break;
++        case 2048: DSK_CALL(2048) break;
++        case 4096: DSK_CALL(4096) break;
++        default: DSK_CALL(0) break;
++      }
++#undef DSK_CALL
++      return;
++    }
+     switch (m * 2 + (e8 ? 1 : 0)) {
+       case 2: avx2kern::gemv_m<1, false>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
+       case 3: avx2kern::gemv_m<1, true>(a.perm, as, b.b, dv, k, n_start, n_end, c.data, (size_t)n); break;
+@@ -394,11 +433,11 @@
+       const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
+       const float* b_scales = b.d + (size_t)ni * group_count;
+       if (ni + 1 < n_end) {
+-        const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
+-        _mm_prefetch(nr, _MM_HINT_T0);
+-        _mm_prefetch(nr + 64, _MM_HINT_T0);
+-        _mm_prefetch(nr + 128, _MM_HINT_T0);
+-        _mm_prefetch(nr + 192, _MM_HINT_T0);
++        const char* ds41_mu_index = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++        _mm_prefetch(ds41_mu_index, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 64, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 128, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 192, _MM_HINT_T0);
+       }
+ 
+       // 4-token blocked path: each decoded group feeds 4 accumulators.
+@@ -525,11 +564,11 @@
+       const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
+       const float* b_scales = b.d + (size_t)ni * group_count;
+       if (ni + 1 < n_end) {
+-        const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
+-        _mm_prefetch(nr, _MM_HINT_T0);
+-        _mm_prefetch(nr + 64, _MM_HINT_T0);
+-        _mm_prefetch(nr + 128, _MM_HINT_T0);
+-        _mm_prefetch(nr + 192, _MM_HINT_T0);
++        const char* ds41_mu_index = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++        _mm_prefetch(ds41_mu_index, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 64, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 128, _MM_HINT_T0);
++        _mm_prefetch(ds41_mu_index + 192, _MM_HINT_T0);
+       }
+ 
+       // 4-token blocked path: per block, each half folds with its own scale.
+@@ -756,6 +795,8 @@
+   using typename Base::input_t;
+   using typename Base::output_t;
+ 
++  static constexpr bool kK2P = true;  // CPU expert optimization: opt in (moe_base.hpp k2p_capable)
++
+   AVX2_MXFP4_MOE_TP() = default;
+   AVX2_MXFP4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
+ 
+@@ -771,6 +812,14 @@
+              avx2kern::kern_mode(), (int)avx2kern::e8m0_mode());
+       if (avx2kern::e8m0_mode() && avx2kern::kern_mode() < 1)
+         printf("[KERN] KT_DS41_MU_MXFP4_E8M0=1 without KT_DS41_MU_MXFP4_KERNEL>=1 is ineffective (no e8m0 copy)\n");
++      printf("[K2EPLUS] KT_DS41_MU_K2EPLUS stages=0x%02x (0 = legacy; arithmetic matches the KERN path, bit-identical)\n",
++             k2p::stages());
++      printf("[DSKERN] KT_DS41_MU_DECODE_KERNEL=%d KT_DS41_MU_DECODE_PREFETCH=%d (0 = gemv_m; 1 = split decode for KERN=1 m<=2, bit-identical)\n",
++             dskern::mode(), dskern::pfd());
++      if (dskern::mode() >= 1 && dskern::pfd() < 0)
++        throw std::runtime_error("KT_DS41_MU_DECODE_PREFETCH: only 0, 1024, 2048 or 4096 are allowed");
++      if (dskern::mode() >= 1 && avx2kern::kern_mode() != 1)
++        printf("[DSKERN] Note: KT_DS41_MU_DECODE_KERNEL requires KT_DS41_MU_MXFP4_KERNEL=1 (current value %d) -> ineffective\n", avx2kern::kern_mode());
+       fflush(stdout);
+     }
+   }
+@@ -793,6 +842,10 @@
+     // Always create full BufferB with owned weight buffer for both modes.
+     return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, data);
+   }
++  // KT_EXPERT_SHM=1: BufferB holding only the fp32 group scales (in an arena); b is set by load_weights.
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only_impl(size_t n, size_t k, void* scales) const {
++    return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, scales, nullptr);
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
+     return std::make_shared<typename T::BufferC>(m, n, data);
+   }
+@@ -810,6 +863,474 @@
+                      *down_bc_[expert_idx], ith, nth);
+   }
+ 
++  // ===========================================================================================================
++  // Optimized decode (stages EPI / BAL, KT_DS41_MU_K2EPLUS): same arithmetic per output row as the legacy forward_decode
++  // with KERN 1/2 (same kernels via gemm_mxfp4 on row views, same bf16 roundings, same act_fn, same Q8/permutation
++  // per 32-group, same FMA chain over j in the weighted sum); only the work split changes:
++  //   * input prepared once (from_mat on one BufferA),
++  //   * gate/up task = the SAME rows of gate and up; SwiGLU + down-activation (Q8 or permuted fp32) of every finished
++  //     32-group in the epilogue (no serial SwiGLU, no pack job),
++  //   * EPI only: 36 tasks/expert (32 rows each), legacy down split (80/expert) and serial weighted sum,
++  //   * BAL: equal-size row ranges over all experts (partial 32-groups completed by the last thread via a counter);
++  //     down by output-row ranges over all experts with the weighted sum in the epilogue.
++  // Returns false (legacy path) if the switch is off or the shape is not the KERN decode shape.
++  // ===========================================================================================================
++  static constexpr int kK2PSlots = 8;
++  uint8_t* k2p_mem_ = nullptr;
++  typename T::BufferA k2p_xa_;
++  typename T::BufferA k2p_ha_[kK2PSlots];
++  ggml_bf16_t* k2p_g_[kK2PSlots] = {};
++  ggml_bf16_t* k2p_u_[kK2PSlots] = {};
++  float* k2p_dt_[kK2PSlots] = {};         // EPI only: fp32 down output (legacy BufferC role)
++  ggml_bf16_t* k2p_do_[kK2PSlots] = {};   // EPI only: bf16 down output (legacy m_local_down_output role)
++  std::atomic<int>* k2p_cnt_ = nullptr;   // [slot][32-group] finished rows (gate+up pairs)
++
++  static inline void k2p_to_bf16(const float* src, ggml_bf16_t* dst, int n) {
++    int j = 0;
++    for (; j + 8 <= n; j += 8) avx2::store_fp32_to_bf16(dst + j, _mm256_loadu_ps(src + j));
++    for (; j < n; j++) {  // same integer rounding as store_fp32_to_bf16 (lane-wise), also for NaN
++      uint32_t u;
++      std::memcpy(&u, src + j, 4);
++      dst[j].bits = (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
++    }
++  }
++  static inline typename T::BufferB k2p_rows(const typename T::BufferB& b, int r0, int r1) {
++    typename T::BufferB v = b;
++    const size_t G = (size_t)b.k_group_count;
++    v.b = b.b + (size_t)r0 * ((size_t)b.k / 2);
++    v.d = b.d + (size_t)r0 * G;
++    v.e8 = b.e8 != nullptr ? b.e8 + (size_t)r0 * G : nullptr;
++    v.n = r1 - r0;
++    return v;
++  }
++
++  bool k2p_alloc() {
++    if (k2p_mem_ != nullptr) return true;
++    const size_t H = config_.hidden_size, I = config_.intermediate_size, G = I / 32;
++    auto al = [](size_t v) { return (v + 63) & ~(size_t)63; };
++    const size_t xa = al(T::BufferA::required_size(1, H, 32)), ha = al(T::BufferA::required_size(1, I, 32));
++    const size_t per = ha + 2 * al(I * 2) + al(H * 4) + al(H * 2);
++    const size_t cnt = al(sizeof(std::atomic<int>) * kK2PSlots * G);
++    const size_t total = xa + kK2PSlots * per + cnt;
++    k2p_mem_ = (uint8_t*)std::aligned_alloc(64, total);
++    if (k2p_mem_ == nullptr) return false;
++    std::memset(k2p_mem_, 0, total);  // first touch on the calling (part) thread -> NUMA-local
++    uint8_t* p = k2p_mem_;
++    k2p_xa_ = typename T::BufferA(1, H, 32, p);
++    p += xa;
++    for (int s = 0; s < kK2PSlots; s++) {
++      k2p_ha_[s] = typename T::BufferA(1, I, 32, p);
++      p += ha;
++      k2p_g_[s] = (ggml_bf16_t*)p;
++      p += al(I * 2);
++      k2p_u_[s] = (ggml_bf16_t*)p;
++      p += al(I * 2);
++      k2p_dt_[s] = (float*)p;
++      p += al(H * 4);
++      k2p_do_[s] = (ggml_bf16_t*)p;
++      p += al(H * 2);
++    }
++    k2p_cnt_ = (std::atomic<int>*)p;
++    for (size_t i = 0; i < kK2PSlots * G; i++) new (&k2p_cnt_[i]) std::atomic<int>(0);
++    return true;
++  }
++
++  // SwiGLU of one 32-group (in place into the gate slot, as apply_activation) + down activation of that group.
++  inline void k2p_act_group(int s, int g, int kern) {
++    ggml_bf16_t* gp = k2p_g_[s] + (size_t)g * 32;
++    const ggml_bf16_t* up = k2p_u_[s] + (size_t)g * 32;
++    const float lim = config_.swiglu_limit, alpha = config_.swiglu_alpha;
++    for (int q = 0; q < 32; q += 8) {
++      __m256 gate_val = avx2::load_bf16_to_fp32(gp + q);
++      __m256 up_val = avx2::load_bf16_to_fp32(up + q);
++      __m256 result = avx2::act_fn(gate_val, up_val, lim, alpha);
++      avx2::store_fp32_to_bf16(gp + q, result);
++    }
++    typename T::BufferA& ha = k2p_ha_[s];
++    if (kern == 2) {
++      int8_t* q = (int8_t*)ha.perm;
++      float* da = (float*)(q + ha.max_m * ha.k);
++      avx2kern::quant_act_q8(gp, 32, q + (size_t)g * 32, da + g);
++    } else {
++      avx2kern::permute_act_bf16(gp, ha.perm + (size_t)g * 32, 32);
++    }
++  }
++
++  // gate + up rows [r0, r1) of slot s (expert e), bf16 store, then SwiGLU/down-prep for every 32-group completed now.
++  inline void k2p_gu_rows(int s, int e, int r0, int r1, int kern, float* tg, float* tu) {
++    const int H = config_.hidden_size, n = r1 - r0;
++    {
++      typename T::BufferB bv = k2p_rows(*gate_bb_[e], r0, r1);
++      typename T::BufferC cv(1, n, tg);
++      avx2::gemm_mxfp4(1, n, H, k2p_xa_, bv, cv, 0, 1);
++    }
++    {
++      typename T::BufferB bv = k2p_rows(*up_bb_[e], r0, r1);
++      typename T::BufferC cv(1, n, tu);
++      avx2::gemm_mxfp4(1, n, H, k2p_xa_, bv, cv, 0, 1);
++    }
++    k2p_to_bf16(tg, k2p_g_[s] + r0, n);
++    k2p_to_bf16(tu, k2p_u_[s] + r0, n);
++    const int G = config_.intermediate_size / 32;
++    for (int g = r0 / 32; g <= (r1 - 1) / 32; g++) {
++      const int covered = std::min(r1, g * 32 + 32) - std::max(r0, g * 32);
++      bool last = covered == 32;
++      if (!last) last = k2p_cnt_[(size_t)s * G + g].fetch_add(covered, std::memory_order_acq_rel) + covered == 32;
++      if (last) k2p_act_group(s, g, kern);
++    }
++  }
++
++  bool k2p_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
++    if (!(k2p::on(k2p::EPI) || k2p::on(k2p::BAL))) return false;
++    const int kern = avx2kern::kern_mode();
++    const int H = config_.hidden_size, I = config_.intermediate_size;
++    if (!(kern == 1 || kern == 2) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
++    if (k > 64) return false;
++    int slot_e[kK2PSlots];
++    int slot_of_j[64];
++    int a = 0;
++    for (int j = 0; j < k; j++) {
++      slot_of_j[j] = -1;
++      if (config_.should_skip_expert(expert_ids[j])) continue;
++      if (a == kK2PSlots) return false;
++      slot_e[a] = (int)expert_ids[j];
++      slot_of_j[j] = a++;
++    }
++    if (!k2p_alloc()) return false;
++#ifdef K2P_TRACE
++    static std::atomic<long> k2p_trace_n{0};
++    if (k2p_trace_n.fetch_add(1) < 3) fprintf(stderr, "[K2P_TRACE] k2p_decode a=%d bal=%d kern=%d\n", a, (int)k2p::on(k2p::BAL), kern);
++#endif
++#if __has_include("../../cpu_backend/moe_timing.h")
++    const bool kt_timing = kt_moe_timing::every() > 0;
++    const uint64_t kt_a = kt_timing ? kt_moe_timing::now_ns() : 0;
++#endif
++    float* out = (float*)output;
++    const bool bal = k2p::on(k2p::BAL);
++    const int G = I / 32;
++    auto pool = config_.pool->get_subpool(tp_part_idx);
++    if (a > 0) {
++      // input once (same bytes as every per-expert from_mat of the legacy path)
++      k2p_xa_.from_mat(1, (const ggml_bf16_t*)input, 0, 1);
++      for (int s = 0; s < a; s++) {
++        k2p_ha_[s].perm_m = 1;
++        k2p_ha_[s].perm_is_q8 = (kern == 2);
++      }
++      if (bal)
++        for (int i = 0; i < a * G; i++) k2p_cnt_[i].store(0, std::memory_order_relaxed);
++    }
++#if __has_include("../../cpu_backend/moe_timing.h")
++    const uint64_t kt_b = kt_timing ? kt_moe_timing::now_ns() : 0;
++#endif
++    if (a > 0) {
++      // ---- gate/up + SwiGLU + down activation ----
++      const int nthr = std::max(1, pool->k2p_worker_count());
++      int T1;
++      if (bal) {
++        const long R = (long)a * I;
++        k2p_bounds(R, nthr, 16, std::max(1L, R / 16), k2p_split(1), k2p_bgu_);
++        T1 = (int)k2p_bgu_.size() - 1;
++        const long* bb = k2p_bgu_.data();
++        pool->do_work_stealing_job(
++            T1, nullptr,
++            [this, bb, I, kern, &slot_e](int t) {
++              static thread_local std::vector<float> tmp;
++              if (tmp.size() < (size_t)2 * I) tmp.resize((size_t)2 * I);
++              long f0 = bb[t];
++              const long f1 = bb[t + 1];
++              while (f0 < f1) {
++                const int s = (int)(f0 / I), r0 = (int)(f0 % I);
++                const int r1 = (int)std::min<long>(I, r0 + (f1 - f0));
++                k2p_gu_rows(s, slot_e[s], r0, r1, kern, tmp.data(), tmp.data() + I);
++                f0 += r1 - r0;
++              }
++            },
++            nullptr);
++      } else {
++        T1 = a * G;
++        pool->do_work_stealing_job(
++            T1, nullptr,
++            [this, G, kern, &slot_e](int t) {
++              float tg[32], tu[32];
++              const int s = t / G, g = t % G;
++              k2p_gu_rows(s, slot_e[s], g * 32, g * 32 + 32, kern, tg, tu);
++            },
++            nullptr);
++      }
++    }
++#if __has_include("../../cpu_backend/moe_timing.h")
++    const uint64_t kt_c = kt_timing ? kt_moe_timing::now_ns() : 0;
++#endif
++    if (a > 0 && bal) {
++      // ---- down by output-row ranges over all experts + weighted sum (same FMA chain over j) ----
++      const int U = H / 8;
++      const int nthr = std::max(1, pool->k2p_worker_count());
++      k2p_bounds(U, nthr, 2, U, k2p_split(2), k2p_bdn_);
++      const int T2 = (int)k2p_bdn_.size() - 1;
++      const long* bd = k2p_bdn_.data();
++      pool->do_work_stealing_job(
++          T2, nullptr,
++          [this, bd, H, I, a, k, out, weights, &slot_e, &slot_of_j](int t) {
++            static thread_local std::vector<float> tmp;
++            static thread_local std::vector<ggml_bf16_t> dob;
++            const int h0 = 8 * (int)bd[t], h1 = 8 * (int)bd[t + 1], n = h1 - h0;
++            if (n <= 0) return;
++            if (tmp.size() < (size_t)n) tmp.resize((size_t)H);
++            if (dob.size() < (size_t)a * n) dob.resize((size_t)kK2PSlots * H);
++            for (int s = 0; s < a; s++) {
++              typename T::BufferB bv = k2p_rows(*down_bb_[slot_e[s]], h0, h1);
++              typename T::BufferC cv(1, n, tmp.data());
++              avx2::gemm_mxfp4(1, n, I, k2p_ha_[s], bv, cv, 0, 1);
++              k2p_to_bf16(tmp.data(), dob.data() + (size_t)s * n, n);
++            }
++            for (int e = 0; e < n; e += 8) {
++              __m256 x0 = _mm256_setzero_ps();
++              for (int j = 0; j < k; j++) {
++                const int s = slot_of_j[j];
++                if (s < 0) continue;
++                __m256 weight = _mm256_set1_ps(weights[j]);
++                __m256 d0 = avx2::load_bf16_to_fp32(dob.data() + (size_t)s * n + e);
++                x0 = _mm256_fmadd_ps(d0, weight, x0);
++              }
++              _mm256_storeu_ps(out + h0 + e, x0);
++            }
++            this->k2p_publish(0, h0, h1);
++          },
++          nullptr);
++    } else if (a > 0) {
++      // ---- EPI only: legacy down split (80 tasks per expert) and legacy serial weighted sum ----
++      const int nth = T::recommended_nth(H);
++      pool->do_work_stealing_job(
++          nth * a, nullptr,
++          [this, nth, H, I, &slot_e](int task_id) {
++            const int s = task_id / nth, ith = task_id % nth;
++            typename T::BufferC cv(1, H, k2p_dt_[s]);
++            avx2::gemm_mxfp4(1, H, I, k2p_ha_[s], *down_bb_[slot_e[s]], cv, ith, nth);
++            cv.to_mat(1, k2p_do_[s], ith, nth);
++          },
++          nullptr);
++    }
++#if __has_include("../../cpu_backend/moe_timing.h")
++    const uint64_t kt_d = kt_timing ? kt_moe_timing::now_ns() : 0;
++#endif
++    if (a == 0 || !bal) {
++      for (int e = 0; e < H; e += 16) {
++        __m256 x0 = _mm256_setzero_ps();
++        __m256 x1 = _mm256_setzero_ps();
++        for (int j = 0; j < k; j++) {
++          const int s = slot_of_j[j];
++          if (s < 0) continue;
++          __m256 weight = _mm256_set1_ps(weights[j]);
++          __m256 d0, d1;
++          avx2::load_16xbf16_to_2x8xfp32(k2p_do_[s] + e, &d0, &d1);
++          x0 = _mm256_fmadd_ps(d0, weight, x0);
++          x1 = _mm256_fmadd_ps(d1, weight, x1);
++        }
++        auto f32out = (__m256*)(out + e);
++        f32out[0] = x0;
++        f32out[1] = x1;
++      }
++      this->k2p_publish(0, 0, H);  // MERGE: whole row range final (serial weighted sum)
++    }
++#if __has_include("../../cpu_backend/moe_timing.h")
++    if (kt_timing) kt_moe_timing::part_done(tp_part_idx, a, kt_a, kt_b, kt_c, kt_d, kt_moe_timing::now_ns());
++#endif
++    return true;
++  }
++
++  // ===========================================================================================================
++  // Batched decode fusion (stage 7): bs 2..9 (forward_prefill, qlen < 10) with the decode scheme. Called after the legacy
++  // buffer assignment and the input from_mat of every expert (gate_up_ba_), so each expert's activation bytes are
++  // exactly the legacy ones. Per expert e with m tokens the kernels are the legacy ones (gemm_mxfp4 with m rows on
++  // row views; m <= 3 KERN path, m >= 4 4-row fp32 path as with K6), same bf16 roundings, same act_fn per token row,
++  // same down activation per token row and 32-group (Q8 for KERN=2 and m <= 3, else permuted fp32), same weighted
++  // sum per token over j. Work split: gate/up = equal row ranges over all experts (all m tokens per row), down =
++  // output-row ranges over all experts, weighted sum of every token in the epilogue, MERGE publish per token.
++  // ===========================================================================================================
++  std::vector<std::atomic<int>> k2p_bcnt_;
++
++  inline void k2p_bs_act_group(int e, int g, int m, int kern) {
++    const int I = config_.intermediate_size;
++    const float lim = config_.swiglu_limit, alpha = config_.swiglu_alpha;
++    typename T::BufferA& ha = *down_ba_[e];
++    for (int mi = 0; mi < m; mi++) {
++      ggml_bf16_t* gp = this->m_local_gate_output_ptr_[e] + (size_t)mi * I + (size_t)g * 32;
++      const ggml_bf16_t* up = this->m_local_up_output_ptr_[e] + (size_t)mi * I + (size_t)g * 32;
++      for (int q = 0; q < 32; q += 8) {
++        __m256 gate_val = avx2::load_bf16_to_fp32(gp + q);
++        __m256 up_val = avx2::load_bf16_to_fp32(up + q);
++        __m256 result = avx2::act_fn(gate_val, up_val, lim, alpha);
++        avx2::store_fp32_to_bf16(gp + q, result);
++      }
++      if (ha.perm_is_q8) {
++        int8_t* q = (int8_t*)ha.perm;
++        float* da = (float*)(q + ha.max_m * ha.k);
++        avx2kern::quant_act_q8(gp, 32, q + (size_t)mi * I + (size_t)g * 32, da + (size_t)mi * (I / 32) + g);
++      } else {
++        avx2kern::permute_act_bf16(gp, ha.perm + (size_t)mi * I + (size_t)g * 32, 32);
++      }
++    }
++  }
++
++  bool k2p_bs(int qlen, int k, const int64_t* expert_ids, const float* weights, void* output, int a) {
++    const int kern = avx2kern::kern_mode();
++    const int H = config_.hidden_size, I = config_.intermediate_size, G = I / 32;
++    if (!(kern == 1 || kern == 2) || config_.quant_config.group_size != 32 || H % 32 != 0 || I % 32 != 0) return false;
++    if (qlen < 1 || qlen >= 10 || a < 1) return false;
++    const int* emap = this->m_expert_id_map_.data();
++    int mmax = 0;
++    for (int s = 0; s < a; s++) {
++      const int e = emap[s];
++      const int m = m_local_num_[e];
++      typename T::BufferA& ha = *down_ba_[e];
++      if (ha.perm == nullptr || gate_up_ba_[e]->perm == nullptr || ha.max_m < (size_t)m) return false;
++      mmax = std::max(mmax, m);
++    }
++    if ((size_t)a * G > k2p_bcnt_.size()) {
++      std::vector<std::atomic<int>> v((size_t)std::max(a, config_.max_len * config_.num_experts_per_tok) * G);
++      k2p_bcnt_.swap(v);
++    }
++    // down activation layout as the legacy from_mat would produce it (flags now, bytes in the gate/up epilogue)
++    for (int s = 0; s < a; s++) {
++      const int e = emap[s];
++      const int m = m_local_num_[e];
++      typename T::BufferA& ha = *down_ba_[e];
++      ha.perm_is_q8 = (kern == 2 && m <= 3);
++      ha.perm_m = m;
++    }
++    for (size_t i = 0; i < (size_t)a * G; i++) k2p_bcnt_[i].store(0, std::memory_order_relaxed);
++#ifdef K2P_TRACE
++    static std::atomic<long> k2p_bs_n{0};
++    if (k2p_bs_n.fetch_add(1) < 3) fprintf(stderr, "[K2P_TRACE] k2p_bs qlen=%d a=%d mmax=%d kern=%d\n", qlen, a, mmax, kern);
++#endif
++    auto pool = config_.pool->get_subpool(tp_part_idx);
++    const int nthr = std::max(1, pool->k2p_worker_count());
++    // ---- gate/up (all m tokens per row) + SwiGLU + down activation per finished 32-group ----
++    {
++      const long R = (long)a * I;
++      k2p_bounds(R, nthr, 16, std::max(1L, R / 16), k2p_split(1), k2p_bgu_);
++      const int T1 = (int)k2p_bgu_.size() - 1;
++      const long* bb = k2p_bgu_.data();
++      pool->do_work_stealing_job(
++          T1, nullptr,
++          [this, bb, I, H, G, kern, emap](int t) {
++            static thread_local std::vector<float> tmp;
++            if (tmp.size() < (size_t)2 * 9 * I) tmp.resize((size_t)2 * 9 * I);
++            long f0 = bb[t];
++            const long f1 = bb[t + 1];
++            while (f0 < f1) {
++              const int s = (int)(f0 / I), r0 = (int)(f0 % I);
++              const int r1 = (int)std::min<long>(I, r0 + (f1 - f0));
++              const int e = emap[s], m = m_local_num_[e], n = r1 - r0;
++              float* tg = tmp.data();
++              float* tu = tmp.data() + (size_t)9 * I;
++              {
++                typename T::BufferB bv = k2p_rows(*gate_bb_[e], r0, r1);
++                typename T::BufferC cv(m, n, tg);
++                avx2::gemm_mxfp4(m, n, H, *gate_up_ba_[e], bv, cv, 0, 1);
++              }
++              {
++                typename T::BufferB bv = k2p_rows(*up_bb_[e], r0, r1);
++                typename T::BufferC cv(m, n, tu);
++                avx2::gemm_mxfp4(m, n, H, *gate_up_ba_[e], bv, cv, 0, 1);
++              }
++              for (int mi = 0; mi < m; mi++) {
++                k2p_to_bf16(tg + (size_t)mi * n, this->m_local_gate_output_ptr_[e] + (size_t)mi * I + r0, n);
++                k2p_to_bf16(tu + (size_t)mi * n, this->m_local_up_output_ptr_[e] + (size_t)mi * I + r0, n);
++              }
++              for (int g = r0 / 32; g <= (r1 - 1) / 32; g++) {
++                const int covered = std::min(r1, g * 32 + 32) - std::max(r0, g * 32);
++                bool last = covered == 32;
++                if (!last)
++                  last = k2p_bcnt_[(size_t)s * G + g].fetch_add(covered, std::memory_order_acq_rel) + covered == 32;
++                if (last) k2p_bs_act_group(e, g, m, kern);
++              }
++              f0 += r1 - r0;
++            }
++          },
++          nullptr);
++    }
++    // ---- down by output-row ranges over all experts, then the weighted sum of every token for these rows ----
++    float* out = (float*)output;
++    {
++      const int U = H / 8;
++      k2p_bounds(U, nthr, 2, U, k2p_split(2), k2p_bdn_);
++      const int T2 = (int)k2p_bdn_.size() - 1;
++      const long* bd = k2p_bdn_.data();
++      pool->do_work_stealing_job(
++          T2, nullptr,
++          [this, bd, H, I, a, k, qlen, out, weights, expert_ids, emap](int t) {
++            static thread_local std::vector<float> tmp;
++            const int h0 = 8 * (int)bd[t], h1 = 8 * (int)bd[t + 1], n = h1 - h0;
++            if (n <= 0) return;
++            if (tmp.size() < (size_t)9 * H) tmp.resize((size_t)9 * H);
++            for (int s = 0; s < a; s++) {
++              const int e = emap[s], m = m_local_num_[e];
++              typename T::BufferB bv = k2p_rows(*down_bb_[e], h0, h1);
++              typename T::BufferC cv(m, n, tmp.data());
++              avx2::gemm_mxfp4(m, n, I, *down_ba_[e], bv, cv, 0, 1);
++              for (int mi = 0; mi < m; mi++)
++                k2p_to_bf16(tmp.data() + (size_t)mi * n, this->m_local_down_output_ptr_[e] + (size_t)mi * H + h0, n);
++            }
++            for (int i = 0; i < qlen; i++) {
++              for (int e8 = h0; e8 < h1; e8 += 8) {
++                __m256 x0 = _mm256_setzero_ps();
++                for (int j = 0; j < k; j++) {
++                  if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
++                  __m256 weight = _mm256_set1_ps(weights[i * k + j]);
++                  __m256 d0 = avx2::load_bf16_to_fp32(this->m_local_down_output_ptr_[expert_ids[i * k + j]] +
++                                                      (size_t)this->m_local_pos_[i][j] * H + e8);
++                  x0 = _mm256_fmadd_ps(d0, weight, x0);
++                }
++                _mm256_storeu_ps(out + (size_t)i * H + e8, x0);
++              }
++              this->k2p_publish(i, h0, h1);
++            }
++          },
++          nullptr);
++    }
++    return true;
++  }
++
++  // Balanced scheduling: task boundaries (units: rows for gate/up, 8-row blocks for down) for the balanced jobs.
++  //   GUIDED (default, KT_DS41_MU_K2EPLUS_GUIDED != 0): factoring, batches of P chunks of remaining / (2P) units, at least
++  //   minc; long contiguous chunks first, small ones at the end, so a worker slowed by its SMT sibling or an IRQ
++  //   holds the job only for a small last chunk (v2 with 2 equal chunks per thread lost 8-13 % under sibling load).
++  //   Else v2: T = min(tmax, P * split) equal chunks. P = pool threads (KT_DS41_MU_K2EPLUS_GP overrides, for tests only).
++  //   The arithmetic per output row does not depend on the boundaries (checked with many splits).
++  std::vector<long> k2p_bgu_, k2p_bdn_;
++  static bool k2p_guided() {
++    static const bool g = [] { const char* e = std::getenv("KT_DS41_MU_K2EPLUS_GUIDED"); return !(e && *e && std::atoi(e) == 0); }();
++    return g;
++  }
++  static void k2p_bounds(long U, int P, long minc, long tmax, int split, std::vector<long>& b) {
++    static const int gp = [] { const char* e = std::getenv("KT_DS41_MU_K2EPLUS_GP"); return (e && *e) ? std::max(1, std::atoi(e)) : 0; }();
++    if (gp > 0) P = gp;
++    b.clear();
++    b.push_back(0);
++    if (U <= 0) return;
++    if (k2p_guided()) {
++      long pos = 0;
++      while (pos < U) {
++        const long c = std::max(minc, (U - pos) / (2L * P));
++        for (int i = 0; i < P && pos < U; i++) {
++          pos += std::min(c, U - pos);
++          b.push_back(pos);
++        }
++      }
++    } else {
++      const long NT = std::max(1L, std::min(tmax, (long)P * split));
++      for (long t = 1; t <= NT; t++) b.push_back(U * t / NT);
++    }
++  }
++
++  // tasks per worker thread for the balanced jobs (KT_DS41_MU_K2EPLUS_SPLIT1 / _SPLIT2, default 2 / 2)
++  static int k2p_split(int which) {
++    static const int s1 = [] { const char* e = std::getenv("KT_DS41_MU_K2EPLUS_SPLIT1"); return (e && *e) ? std::max(1, std::atoi(e)) : 2; }();
++    static const int s2 = [] { const char* e = std::getenv("KT_DS41_MU_K2EPLUS_SPLIT2"); return (e && *e) ? std::max(1, std::atoi(e)) : 2; }();
++    return which == 1 ? s1 : s2;
++  }
++
+   void load_weights() {
+     int group_size = config_.quant_config.group_size;
+     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
+@@ -1073,6 +1594,12 @@
+   std::vector<void*> tp_owned_gate_bufs_;
+   std::vector<void*> tp_owned_up_bufs_;
+   std::vector<void*> tp_owned_e8_bufs_;  // E8M0 scale buffers
++  using ExpertArena = typename AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::ExpertArena;
++  // KT_EXPERT_SHM=1: per part [gate_w, up_w, down_w] memfd arenas holding the packed e2m1 weights (expert eid at
++  // base + eid * stride); the scale arenas live in the parts (AVX2_MOE_BASE::expert_arenas_). Empty otherwise.
++  std::vector<std::vector<ExpertArena>> tp_weight_arenas_;
++  // Experts copied into the arenas by the last load_weights(), per part (skipped/masked experts are not counted).
++  std::vector<size_t> tp_arena_loaded_;
+ 
+   // Compact E8M0 copy of the FP32 group scales for every CPU expert, allocated and
+   // filled on the part's NUMA node. A matrix whose scales are not all exact powers of two (2^-127 ..
+@@ -1124,7 +1651,7 @@
+       bytes[i] = (size_t)n_exp.load() * per_exp;
+     });
+     for (int i = 0; i < this->tp_count; i++)
+-      printf("[KERN] E8M0 part %d: %ld Matrizen e8m0, %ld Rueckfall fp32, %.1f MB e8m0-Skalen\n", i, ok[i], fb[i],
++      printf("[KERN] E8M0 part %d: %ld e8m0 matrices, %ld fp32 fallbacks, %.1f MB e8m0 scales\n", i, ok[i], fb[i],
+              bytes[i] / 1e6);
+     fflush(stdout);
+   }
+@@ -1134,16 +1661,80 @@
+   using Base::Base;
+ 
+   ~TP_MOE() {
+-    for (void* p : tp_owned_down_bufs_)
+-      if (p) std::free(p);
+-    for (void* p : tp_owned_gate_bufs_)
+-      if (p) std::free(p);
+-    for (void* p : tp_owned_up_bufs_)
+-      if (p) std::free(p);
++    for (size_t i = 0; i < tp_owned_down_bufs_.size(); i++) {
++      // arena-backed parts: these pointers are arena bases, freed below with the arenas
++      if (i < tp_weight_arenas_.size() && !tp_weight_arenas_[i].empty()) continue;
++      if (tp_owned_down_bufs_[i]) std::free(tp_owned_down_bufs_[i]);
++      if (i < tp_owned_gate_bufs_.size() && tp_owned_gate_bufs_[i]) std::free(tp_owned_gate_bufs_[i]);
++      if (i < tp_owned_up_bufs_.size() && tp_owned_up_bufs_[i]) std::free(tp_owned_up_bufs_[i]);
++    }
++    for (auto& part : tp_weight_arenas_)
++      for (auto& a : part) AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::free_expert_arena(a);
+     for (void* p : tp_owned_e8_bufs_)
+       if (p) std::free(p);
+   }
+ 
++  // Per TP part: [(fd, size, stride)] for gate_w, up_w, down_w, gate_s, up_s, down_s (KT_EXPERT_SHM=1; the list of
++  // a part is empty otherwise). Weights are packed e2m1 bytes, N x K/2 (gate/up) or K x N/2 (down) per expert;
++  // scales are fp32 (group 32). Expert slot = PHYSICAL index (physical_to_logical_map maps it to the logical expert).
++  std::vector<std::vector<std::tuple<int, size_t, size_t>>> expert_arena_infos() const {
++    std::vector<std::vector<std::tuple<int, size_t, size_t>>> out;
++    for (size_t i = 0; i < this->tps.size(); i++) {
++      std::vector<std::tuple<int, size_t, size_t>> v;
++      if (i < tp_weight_arenas_.size() && !tp_weight_arenas_[i].empty()) {
++        for (auto& a : tp_weight_arenas_[i]) v.emplace_back(a.fd, a.size, a.stride);
++        for (auto& t : this->tps[i]->expert_arena_info()) v.push_back(t);
++      }
++      out.push_back(v);
++    }
++    return out;
++  }
++
++  // JSON text (parsed to a dict by the binding): format, per part the six arenas with name, dtype, shape (rows x
++  // columns of one expert), per-expert length, fd/size/stride, and the fill state (experts copied vs. expert_num;
++  // "complete" = load_weights finished and no expert skipped in any part).
++  std::string expert_arena_layout_json() const {
++    const int gs = this->config.quant_config.group_size;
++    bool complete = this->weights_loaded && !tp_weight_arenas_.empty();
++    std::string parts;
++    for (size_t i = 0; i < this->tps.size(); i++) {
++      const bool arena = i < tp_weight_arenas_.size() && !tp_weight_arenas_[i].empty();
++      const auto& tpc = this->tps[i]->config_;
++      const size_t n = tpc.intermediate_size, h = tpc.hidden_size;
++      const size_t loaded = i < tp_arena_loaded_.size() ? tp_arena_loaded_[i] : 0;
++      if (!arena || loaded != (size_t)tpc.expert_num) complete = false;
++      auto infos = this->tps[i]->expert_arena_info();
++      struct Row { const char* name; const char* dtype; size_t rows, cols, len; };
++      const Row rows[6] = {{"gate_w", "e2m1_packed", n, h / 2, n * h / 2}, {"up_w", "e2m1_packed", n, h / 2, n * h / 2},
++                           {"down_w", "e2m1_packed", h, n / 2, h * n / 2}, {"gate_s", "fp32", n, h / gs, n * (h / gs) * 4},
++                           {"up_s", "fp32", n, h / gs, n * (h / gs) * 4}, {"down_s", "fp32", h, n / gs, h * (n / gs) * 4}};
++      std::string arenas;
++      if (arena) {
++        for (int a = 0; a < 6; a++) {
++          int fd;
++          size_t size, stride;
++          if (a < 3) {
++            fd = tp_weight_arenas_[i][a].fd;
++            size = tp_weight_arenas_[i][a].size;
++            stride = tp_weight_arenas_[i][a].stride;
++          } else {
++            std::tie(fd, size, stride) = infos[a - 3];
++          }
++          if (a) arenas += ",";
++          arenas += std::string("{\"name\":\"") + rows[a].name + "\",\"dtype\":\"" + rows[a].dtype +
++                    "\",\"rows\":" + std::to_string(rows[a].rows) + ",\"cols\":" + std::to_string(rows[a].cols) +
++                    ",\"len\":" + std::to_string(rows[a].len) + ",\"fd\":" + std::to_string(fd) +
++                    ",\"size\":" + std::to_string(size) + ",\"stride\":" + std::to_string(stride) + "}";
++        }
++      }
++      if (i) parts += ",";
++      parts += "{\"part\":" + std::to_string(i) + ",\"expert_num\":" + std::to_string(tpc.expert_num) +
++               ",\"loaded\":" + std::to_string(loaded) + ",\"arenas\":[" + arenas + "]}";
++    }
++    return std::string("{\"format\":\"kt-expert-arena/1\",\"index\":\"physical\",\"group_size\":") + std::to_string(gs) +
++           ",\"complete\":" + (complete ? "true" : "false") + ",\"parts\":[" + parts + "]}";
++  }
++
+   void load_weights() override {
+     auto& config = this->config;
+     auto& tps = this->tps;
+@@ -1163,6 +1754,11 @@
+       tp_owned_down_bufs_.resize(this->tp_count, nullptr);
+       tp_owned_gate_bufs_.resize(this->tp_count, nullptr);
+       tp_owned_up_bufs_.resize(this->tp_count, nullptr);
++      const bool use_shm = AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::expert_shm_enabled();
++      if (use_shm) {
++        tp_weight_arenas_.resize(this->tp_count);  // sized here, single-threaded: the part jobs only touch their own slot
++        tp_arena_loaded_.assign(this->tp_count, 0);
++      }
+       pool->dispense_backend()->do_numa_job([&, this](int i) {
+         auto* tp = tps[i].get();
+         auto& tpc = tp->config_;
+@@ -1174,17 +1770,37 @@
+         // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
+         size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
+         size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        uint8_t* up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
+-        tp_owned_gate_bufs_[i] = gate_buf;
+-        tp_owned_up_bufs_[i] = up_buf;
+         // down: [hidden × intermediate], TP slices along K → non-contiguous
+         size_t down_wt_per_expert = (size_t)tpc.hidden_size * per_tp_interm / 2;
+         size_t alloc_size = ((size_t)tpc.expert_num * down_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
+-        if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        uint8_t *gate_buf, *up_buf, *down_buf;
++        if (use_shm) {
++          // Weight bytes per expert are 64-aligned for these shapes, so arena stride == bytes per expert and the
++          // per-expert pointer arithmetic below stays valid.
++          if (gate_up_wt_per_expert % 64 || down_wt_per_expert % 64)
++            throw std::runtime_error("KT_EXPERT_SHM: per-expert weight bytes must be 64-aligned");
++          using Base = AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>;
++          for (auto& a : tp_weight_arenas_[i]) Base::free_expert_arena(a);  // reload: drop the previous arenas
++          tp_weight_arenas_[i].clear();
++          std::vector<ExpertArena> arenas;
++          arenas.push_back(Base::make_expert_arena(gate_up_wt_per_expert, tpc.expert_num, "kt_gate_w"));
++          arenas.push_back(Base::make_expert_arena(gate_up_wt_per_expert, tpc.expert_num, "kt_up_w"));
++          arenas.push_back(Base::make_expert_arena(down_wt_per_expert, tpc.expert_num, "kt_down_w"));
++          gate_buf = arenas[0].base;
++          up_buf = arenas[1].base;
++          down_buf = arenas[2].base;
++          tp_weight_arenas_[i] = std::move(arenas);
++        } else {
++          gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
++          down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
++          if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        }
++        tp_owned_gate_bufs_[i] = gate_buf;
++        tp_owned_up_bufs_[i] = up_buf;
+         tp_owned_down_bufs_[i] = down_buf;
++        std::atomic<size_t> arena_loaded{0};
+ 
+         auto subpool = pool->get_subpool(i);
+         subpool->do_work_stealing_job(
+@@ -1248,10 +1864,16 @@
+                 convert_or_copy(dst_ds + (size_t)row * per_tp_groups,
+                                 src_ds + (size_t)row * full_interm_groups + (size_t)i * per_tp_groups, per_tp_groups);
+               }
++              arena_loaded.fetch_add(1, std::memory_order_relaxed);
+             },
+             nullptr);
++        if (use_shm) tp_arena_loaded_[i] = arena_loaded.load();
+       });
+     } else {
++      // The flat-buffer path copies into BufferB::b of the base block, which does not exist under KT_EXPERT_SHM=1
++      // (scale-only BufferB): fail closed instead of loading no weights.
++      if (AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::expert_shm_enabled())
++        throw std::runtime_error("KT_EXPERT_SHM=1: the MXFP4 arena build needs the per-expert loader (config.gate_projs)");
+       int group_size = config.quant_config.group_size;
+       pool->dispense_backend()->do_numa_job([&, this](int i) {
+         auto& tpc = tps[i]->config_;
+diff -ruN a/kt-kernel/operators/moe-tp.hpp b/kt-kernel/operators/moe-tp.hpp
+--- a/kt-kernel/operators/moe-tp.hpp	2026-08-17 10:25:14.000000000 +0200
++++ b/kt-kernel/operators/moe-tp.hpp	2026-10-18 12:44:34.827593021 +0200
+@@ -209,11 +209,12 @@
+     int qlen = *qlen_ptr;
+ 
+     auto pool = config.pool;
++    const bool k2p_m = k2p_merge_begin(qlen, output, incremental);  // In-part TP merge (default: false)
+     pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
+       tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
+     });
+ 
+-    merge_results(qlen, output, incremental);
++    if (!k2p_merge_end(k2p_m)) merge_results(qlen, output, incremental);
+ #ifdef FORWARD_TIME_REPORT
+     auto end = std::chrono::high_resolution_clock::now();
+     auto forward_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+@@ -247,6 +248,11 @@
+ 
+   virtual void load_weights() = 0;
+ 
++  // In-part TP merge hooks: begin returns true if the parts merge themselves; end returns true if every output block
++  // was merged by the parts (otherwise merge_results runs as before and rewrites all rows with the same values).
++  virtual bool k2p_merge_begin(int qlen, void* output, bool incremental) { return false; }
++  virtual bool k2p_merge_end(bool active) { return false; }
++
+   virtual void merge_results(int qlen, void* output) = 0;
+ 
+   virtual void merge_results(int qlen, void* output, bool incremental) {

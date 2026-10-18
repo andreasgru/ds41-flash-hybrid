@@ -1,4 +1,4 @@
-Long-context inference with CPU expert offload — source release v2 candidate
+Long-context inference with CPU expert offload — K22 source release candidate v3.0.0-k22
 
 Own portable tooling and patch modifications are licensed under Apache-2.0. Upstream copyright notices remain in source and patches. This notice does not replace upstream licenses and does not grant rights to model weights.
 
@@ -27,4 +27,4 @@ Pin bb05e0810b87e74709d9f4c4545f1f57a1b386f5. BSD license in `licenses/`.
 
 DeepSeek-V4.1-Flash weights and Engram data are not included. Consult the applicable upstream model distribution and license for the exact supplied weights. Tooling licenses do not change those terms.
 
-Warmup text is original. No third-party text corpus, request bodies, run logs, model weights, Engram shards or private source reconstruction are distributed.
+Warmup text is original. No third-party text corpus, request bodies, run logs, model weights, Engram shards or private working trees are distributed.

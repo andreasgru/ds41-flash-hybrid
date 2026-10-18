@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the portable live r3 command and environment without launching it.
+"""Resolve the portable K22 command and environment without launching it.
 
 Origin: own implementation of the selected live configuration. Apache-2.0.
 Historical diagnostic builds are rejected; their artifacts are not bundled.
@@ -17,17 +17,38 @@ def resolve(env):
     actual=manifest.receipt(root,Path(env['DS41_PYTHON']))
     if json.loads((root/'build-manifest.json').read_text())!=actual:
         raise ValueError('BUILD_MANIFEST_MISMATCH')
-    required={'DS41_MODE':'A','DS41_FIPRE':'FULL','DS41_CB':'1','DS41_CBPKG':'multi-user',
+    required={'DS41_MODE':'A','DS41_FIPRE':'FULL','DS41_CB':'1','DS41_CBPKG':'multi-user-dk',
               'DS41_FP8TREE':'1','DS41_FP8TREEDIR':'sources','DS41_CHUNK':'16384',
-              'DS41_RADIX':'1','DS41_HICACHE':'0','DS41_ENGRAM_PKG':'numa'}
+              'DS41_RADIX':'1','DS41_HICACHE':'0','DS41_ENGRAM_PKG':'numa',
+              'DS41_MEMMAX':'480','KT_DS41_MU_DECODE_KERNEL':'1',
+              'KT_DS41_MU_DECODE_PREFETCH':'2048','KT_DS41_MU_K2EPLUS':'1',
+              'SGLANG_DS41_MU_MXFP8_B12X':'1','SGLANG_DS41_MU_A1_CACHE':'1',
+              'SGLANG_DS41_MU_A1_SWAP':'1','SGLANG_DS41_MU_A1_BUDGET':'2',
+              'SGLANG_DS41_MU_A1_STAT_S':'1','SGLANG_DS41_MU_A1_RING':'32',
+              'SGLANG_DS41_MU_A1_STAGER':'1','SGLANG_DS41_MU_A1_B12X_DECODE':'1',
+              'SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS':'1',
+              'DS41_KT_EXPERT_SHM':'0','KT_EXPERT_SHM':'0',
+              'KT_GPU_STREAM_ZEROCOPY':'0','A1_SOURCE':'ckpt',
+              'KT_DS41_MU_MXFP4_KERNEL':'1','KT_DS41_MU_MXFP4_E8M0':'1'}
     if any(env.get(k)!=v for k,v in required.items()):
-        raise ValueError('LIVE_CONFIGURATION_REQUIRED')
+        raise ValueError('K22_CONFIGURATION_REQUIRED')
     prohibited=['DS41_STREAMB','DS41_ZDIAG','DS41_HM3TREE','DS41_HM4TREE','DS41_HM4A',
                 'DS41_ROUTING_DUMP','DS41_MOETIME','DS41_ENGRAM_RAM','KT_DS41_MU_STREAM_TBUCKET',
                 'SGLANG_DS41_MU_P3','SGLANG_DS41_MU_P3_TILE','SGLANG_DS41_MU_P3_SHARE',
                 'SGLANG_DS41_MU_MOE_WORKSPACE_MAX_TOKENS','SGLANG_DS41_MU_OOM_TEST']
     if any(env.get(k) not in (None,'','0') for k in prohibited):
         raise ValueError('DIAGNOSTIC_CONFIGURATION_UNSUPPORTED')
+    k22_absent=['KT_DS41_MU_K2EPLUS_GUIDED','KT_DS41_MU_K2EPLUS_STAGES',
+                'KT_DS41_MU_K2EPLUS_SPLIT1','KT_DS41_MU_K2EPLUS_SPLIT2',
+                'SGLANG_DS41_MU_A1_TRACE','SGLANG_DS41_MU_A1_HYSTERESIS',
+                'SGLANG_DS41_MU_A1_MIN_RESIDENCY','SGLANG_DS41_MU_MXFP8_B12X_SHAPES',
+                'SGLANG_DS41_MU_MXFP8_B12X_DUMP','SGLANG_DS41_MU_MXFP8_B12X_DUMP_N']
+    if any(env.get(k) not in (None,'') for k in k22_absent):
+        raise ValueError('K22_CONFIGURATION_OVERRIDE_UNSUPPORTED')
+    k22_defaults={'SGLANG_DS41_MU_A1_MEMMAX':'480',
+                  'SGLANG_DS41_MU_MXFP8_B12X_MAX_M':'1'}
+    if any(env.get(k,v)!=v for k,v in k22_defaults.items()):
+        raise ValueError('K22_CONFIGURATION_OVERRIDE_UNSUPPORTED')
     if env.get('SGLANG_DS41_MU_RADIX_F2_VALUE','0')!='0':
         raise ValueError('RADIX_VALUE_NOT_ACCEPTED')
     placement=Path(env['DS41_PLACEMENT'])
@@ -80,9 +101,9 @@ def resolve(env):
         '--disable-shared-experts-fusion','--enable-metrics','--disable-flashinfer-autotune',
         '--cuda-graph-bs-decode',*env['DS41_GRAPH_BS'].split(),'--enable-cache-report']
     prefixes=('DS41_','KT_','DSV41_','SGLANG_','CUDA_','FLASHINFER_','TORCH_','TORCHINDUCTOR_','TRITON_','OMP_','XDG_','NCCL_','HF_','TRANSFORMERS_','PYTHON')
-    public_env={k:v for k,v in resolved.items() if k.startswith(prefixes) or k in ('HOME','PATH','TMPDIR','LD_LIBRARY_PATH','PYTORCH_CUDA_ALLOC_CONF')}
+    public_env={k:v for k,v in resolved.items() if k.startswith(prefixes) or k in ('HOME','PATH','TMPDIR','LD_LIBRARY_PATH','PYTORCH_CUDA_ALLOC_CONF','A1_SOURCE')}
     return {'command':command,'environment':public_env,'build_manifest':actual,
-            'scope':'live r3 resolution; no server started'}
+            'scope':'K22 resolution; no server started'}
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(); parser.add_argument('--print-command',action='store_true',required=True)
