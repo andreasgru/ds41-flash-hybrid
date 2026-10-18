@@ -1,10 +1,18 @@
 # Changelog
 
+## v3.2.1-b10-v6 — documentation update
+
+- Expand the 18 October historical comparison to seven starts each for DeepSeek-V4.1-Flash (original) and DeepSeek-V4.1-Flash-1017, computed from the fixed archive cohort with the reviewed b10-band-v2 and independently cross-checked with tar/jq.
+- Report both aligned m8 readings, partial quality counts and arithmetic first attempts separately from the three allowed one-item retries. The successor's cohort m8 median is 1.16% higher with warmups and 1.07% higher without warmups; full workload acceptance remains untested.
+- Use the model names DeepSeek-V4.1-Flash (original) and DeepSeek-V4.1-Flash-1017 consistently.
+- Clarify that decode bs8 uses 8 identical prompts, while m8 uses eight distinct prompts and retains both readings, with warmups included and excluded.
+- Product code, tests, source patches and runtime pins remain unchanged. Native rebuilding, GPU execution and live-service operation remain untested.
+
 ## v3.2.0-b10-v6 — source reconstruction candidate
 
 - Add the B10 CPU kernel3 on the pinned DK/Arena base; retain K22b GPU expert decode, command arguments and memory limits. DK selectors remain exported but do not select kernel3.
 - Reconstruct the eight-patch tree and add the independent B10 environment comparator. Preserve prior stage commits and tags.
-- Report the fixed 18 October ten-start historical cohort separately for models1016 (n7) and1017 (n3), including both m8 readings, partial quality counts and separate arithmetic retries. Raw data remain internal.
+- Report the fixed 18 October ten-start historical cohort separately for DeepSeek-V4.1-Flash (original), n=7, and DeepSeek-V4.1-Flash-1017, n=3, including both m8 readings, partial quality counts and separate arithmetic retries. Raw data remain internal.
 - Native rebuilding and positive deployment remain untested; five historical full-load gates stay red.
 
 ## v3.1.1-k22b — documentation consistency

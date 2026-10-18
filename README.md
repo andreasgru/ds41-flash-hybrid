@@ -1,6 +1,6 @@
 # ds41-flash-hybrid
 
-B10-v6 source release candidate, tag `v3.2.0-b10-v6`, for DeepSeek-V4.1-Flash with pinned SGLang and KTransformers. B10 adds CPU kernel 3 on the DK/Arena source base, retaining the K22b GPU-resident expert B12X W4A16 decode and streamed CUTLASS prefill. Weights, Engram data, runtime environments and native binaries are supplied separately.
+B10-v6 source release candidate, tag `v3.2.1-b10-v6`, built for DeepSeek-V4.1-Flash (original) with pinned SGLang and KTransformers. The same recorded build also ran DeepSeek-V4.1-Flash-1017 in seven archived starts; the historical comparison is reported below. B10 adds CPU kernel 3 on the DK/Arena source base, retaining the K22b GPU-resident expert B12X W4A16 decode and streamed CUTLASS prefill. Weights, Engram data, runtime environments and native binaries are supplied separately.
 
 **Status: source reconstruction and 18 offline real-input tests passed.** Static interface and actual print-path workspace counterchecks passed. Native rebuilding, GPU execution, server startup and full workload acceptance remain untested. Historical measurements describe recorded implementations, not a newly built public artifact.
 
@@ -22,23 +22,25 @@ The service limit remains 480 GiB with no swap; preflight requires 465 GiB avail
 
 ## Historical B10-v6 measurements — 18 October 2026
 
-The fixed cohort contains all ten complete archived starts selected for this comparison: seven with model revision 1016 and three with revision 1017. Earlier auxiliary starts and the following start are excluded. Values were computed on Linux from internal archives by the reviewed `b10-band-v2` tool (source SHA256 `3863fb38c7ffd5e7a87feee9489ae6f5f440416c5f3554d46b7864407aa0464b`; tool archive SHA256 `b68846e18460896eba643fcd3d8d236f843b30463f8d6bea7f910abb9515ac2e`). Raw measurement data are internal and are not published. Each cell is min / median / max across starts, in tokens/s.
+The fixed cohort contains fourteen complete archived starts selected for this comparison on 18 October 2026: seven with DeepSeek-V4.1-Flash (original) and seven with DeepSeek-V4.1-Flash-1017. Earlier auxiliary starts and starts outside this cohort are excluded. Values were computed on Linux from internal archives by the reviewed `b10-band-v2` tool (source SHA256 `3863fb38c7ffd5e7a87feee9489ae6f5f440416c5f3554d46b7864407aa0464b`; tool archive SHA256 `b68846e18460896eba643fcd3d8d236f843b30463f8d6bea7f910abb9515ac2e`) and cross-checked by the independent tar/jq computation. Raw measurement data are internal and are not published. Each cell is min / median / max across starts, in tokens/s unless stated otherwise.
 
-| Metric | Model 1016, n=7 starts | Model 1017, n=3 starts |
+| Metric | DeepSeek-V4.1-Flash (original), n=7 starts | DeepSeek-V4.1-Flash-1017, n=7 starts |
 |---|---:|---:|
-| bs1x20, 20 measured + 1 excluded warmup | 63.470 / 63.741 / 64.432 | 64.503 / 64.523 / 64.657 |
-| Decode bs1, all 6 including warmup | 64.523 / 64.623 / 64.734 | 65.128 / 65.233 / 65.492 |
-| Decode bs4, all 6 including warmup | 103.687 / 106.003 / 108.317 | 110.514 / 110.659 / 110.713 |
-| Decode bs8, all 6 including warmup | 193.413 / 200.878 / 205.069 | 204.968 / 210.257 / 214.920 |
-| m8_median_22, aligned, includes 2 warmups | 140.462 / 141.504 / 142.275 | 142.294 / 143.110 / 143.140 |
-| Aligned m8, 20 measured | 140.591 / 142.018 / 142.488 | 142.549 / 143.414 / 143.541 |
-| qprobe2 partial correct count / 88 | 75 / 76 / 76 | 76 / 76 / 76 |
+| bs1x20, 20 measured + 1 excluded warmup | 63.470 / 63.741 / 64.432 | 64.153 / 64.503 / 64.657 |
+| Decode bs1, all 6 including warmup | 64.523 / 64.623 / 64.734 | 65.128 / 65.332 / 65.717 |
+| Decode bs4, all 6 including warmup | 103.687 / 106.003 / 108.317 | 108.488 / 110.659 / 110.846 |
+| Decode bs8, 8 identical prompts, all 6 including warmup | 193.413 / 200.878 / 205.069 | 204.968 / 214.105 / 214.920 |
+| m8_median_22, aligned, includes 2 warmups | 140.462 / 141.504 / 142.275 | 142.294 / 143.140 / 144.476 |
+| Aligned m8, 20 measured | 140.591 / 142.018 / 142.488 | 142.549 / 143.541 / 144.554 |
+| qprobe2 partial correct count / 88 | 75 / 76 / 76 | 75 / 76 / 77 |
 | Separate JSON validity / 10 | 10 / 10 / 10 | 10 / 10 / 10 |
-| Arithmetic first attempt / 36 | 36 / 36 / 36 | 35 / 35 / 36 |
+| Arithmetic first attempt / 36 | 36 / 36 / 36 | 35 / 36 / 36 |
 
-bs1x20 uses the same synthetic prompt, output length 256 and thinking disabled. Decode has five measured repetitions and one warmup; the legacy extractor includes all six. m8 uses eight distinct synthetic prompts and aligned-stream rates; its 22-record median includes two warmups while the independently recomputed 20-record metric excludes them. The unaligned reading is invalid for staggered starts. These short repeated synthetic-load starts are not full workload acceptance or a controlled statistical trial.
+Across these two seven-start groups, the aligned m8 median for DeepSeek-V4.1-Flash-1017 is 1.16% higher with warmups included and 1.07% higher with warmups excluded. The single-request bs1x20 ranges overlap; its roughly 1% median difference is also descriptive. These observations describe the selected historical cohort.
 
-The qprobe2 correct count excludes the separately counted JSON tasks; it is a partial count, not a complete quality score. Two model-1017 starts scored 35/36 arithmetic initially and passed an allowed one-item retry (1/1), reported separately; the third scored 36/36 without retry. Model-1017 numerical-reference data were captured without a G2 verdict against the model-1016 reference. No 1017 numerical-gate pass or standard change is implied. No ranges from other cohorts are included in this table.
+bs1x20 uses the same synthetic prompt, output length 256 and thinking disabled. Decode has five measured repetitions and one warmup; the legacy extractor includes all six. Decode bs8 uses 8 identical prompts, a favorable repeated-prompt workload. m8 uses eight distinct synthetic prompts and aligned-stream rates; its 22-record median includes two warmups while the independently recomputed 20-record metric excludes them. The unaligned reading is invalid for staggered starts. These short repeated synthetic-load starts are not full workload acceptance or a controlled statistical trial.
+
+The qprobe2 correct count excludes the separately counted JSON tasks; it is a partial count, not a complete quality score. Three DeepSeek-V4.1-Flash-1017 starts scored 35/36 arithmetic initially and passed an allowed one-item retry (1/1), reported separately; the other four scored 36/36 without retry. DeepSeek-V4.1-Flash-1017 numerical-reference data were captured without a G2 verdict against the DeepSeek-V4.1-Flash (original) reference. No numerical-gate pass for DeepSeek-V4.1-Flash-1017 or standard change is implied. No ranges from other cohorts are included in this table.
 
 ## Historical K22b measurements
 
@@ -145,6 +147,7 @@ Weights are not redistributed; the tooling license grants no model/data rights. 
 
 ## Versions
 
+- `v3.2.1-b10-v6`: documentation update with seven starts per model, consistent model names and explicit identical-prompt bs8 conditions; product code and tests unchanged.
 - `v3.2.0-b10-v6`: B10 CPU kernel 3, K22b GPU expert path and fixed ten-start historical measurement cohort.
 
 - `v3.1.1-k22b`: documentation consistency update; product code and tests unchanged.

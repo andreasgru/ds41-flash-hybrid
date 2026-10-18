@@ -1,6 +1,6 @@
 # Validation and explicit limits
 
-**B10-v6 candidate `v3.2.0-b10-v6`: eight-patch source reconstruction and 18 offline real-input tests passed.** See the current-stage evidence below. All following K22b-specific results remain historical evidence for that earlier stage.
+**B10-v6 candidate `v3.2.1-b10-v6`: eight-patch source reconstruction and 18 offline real-input tests passed.** This documentation release retains the v3.2.0-b10-v6 product and test files; the recorded test evidence below applies to that unchanged implementation. All following K22b-specific results remain historical evidence for that earlier stage.
 
 ## Required real inputs and existing suites
 
@@ -75,4 +75,4 @@ Historical K22b verification record (product code at v3.1.1-k22b): the final arc
 
 B10-v6 current-stage evidence: the first 18 offline tests passed in 28.133 s against eight patches and 81 runtime pins (63 source files). The independent B10 oracle retains 93 environment entries plus the permitted port and 74 command arguments; only the selected kernel value changes from 1 to 3 relative to K22b. Static interface checks found 14 readers and detected the removed-reader/state-key controls. The actual print path accepted default/zero workspace settings and rejected half-chunk/double-chunk/invalid overrides. These additional verification scripts and logs are internal and are not published. Native rebuilding, GPU inference and live service remain untested; no pass is implied.
 
-B10 source equality is against the derived cleaned target: 10,410 files and five links, with two newly reversed B10 native files. Four K22b and 56 K22 raw reversals are inherited by pinned journals. Three fail-closed source controls passed. Historical B10 measurement definitions, fixed cohort date, tool hashes, separate model populations and both m8 readings are in README. Numerical-reference capture for model1017 is not a G2 verdict. All five historical full-load gates remain red.
+B10 source equality is against the derived cleaned target: 10,410 files and five links, with two newly reversed B10 native files. Four K22b and 56 K22 raw reversals are inherited by pinned journals. Three fail-closed source controls passed. Historical B10 measurement definitions, fixed cohort date, tool hashes, separate model populations and both m8 readings are in README. Numerical-reference capture for DeepSeek-V4.1-Flash-1017 is not a G2 verdict. All five historical full-load gates remain red.
