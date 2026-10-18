@@ -1,0 +1,711 @@
+Origin: Pinned K22b four-file source overlay
+Purpose: Add GPU-resident B12X W4A16 experts with checkpoint swaps
+License: Apache-2.0; preserve upstream notices
+
+diff -ruN a/python/sglang/srt/layers/moe/a1_exec.py b/python/sglang/srt/layers/moe/a1_exec.py
+--- a/python/sglang/srt/layers/moe/a1_exec.py	2026-10-18 12:44:34.835617165 +0200
++++ b/python/sglang/srt/layers/moe/a1_exec.py	2026-10-18 12:57:39.345761472 +0200
+@@ -67,6 +67,105 @@
+          ("w1", "scale"): "gate_s", ("w3", "scale"): "up_s", ("w2", "scale"): "down_s"}
+ 
+ _RT: Optional["A1Runtime"] = None
++# SGLANG_DS41_MU_A1_B12X_DECODE=1: the resident slots hold the SM120 b12x w4a16
++# packed layout, not the CUTLASS MXFP4 layout. Every published expert is then
++# packed *inside the slot*, with the very functions the first load uses
++# (Mxfp4FlashinferCutlassMoEMethod.process_weights_after_loading), so the
++# prepared views the b12x runner holds stay valid across a swap. Unset or 0:
++# Nothing below runs when disabled; the CUTLASS landing-pad permutation stays.
++_B12X_ON = os.environ.get("SGLANG_DS41_MU_A1_B12X_DECODE", "0") != "0"
++_B12X_TILES = (16, 64, 8)  # _PACKED_TILE_SIZE, _PACKED_TILE_N_SIZE, _PACK_FACTOR_4BIT
++
++
++def _b12x_pack_ops():
++    """The vendored pack primitives, with their tile constants checked."""
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
++        _PACKED_TILE_N_SIZE,
++        _PACKED_TILE_SIZE,
++        _PACK_FACTOR_4BIT,
++        _pack_e8m0_k32_scales,
++        _repack_4bit_no_perm,
++    )
++
++    got = (_PACKED_TILE_SIZE, _PACKED_TILE_N_SIZE, _PACK_FACTOR_4BIT)
++    if got != _B12X_TILES:
++        raise RuntimeError(f"A1_B12X: FlashInfer pack tile constants changed: {got}")
++    return _repack_4bit_no_perm, _pack_e8m0_k32_scales
++
++
++def b12x_scratch(K: int, N: int, device) -> Dict[str, torch.Tensor]:
++    """Preallocated int32 scratch of the weight repack.
++
++    ``_repack_4bit_no_perm`` and the transpose in front of it need three
++    int32 buffers per projection; they are allocated once per copy stream
++    (the swap path runs on one stream, so one set per device is enough).
++    """
++    k13, n13 = K // 16, (2 * N) // 64
++    k2, n2 = N // 16, K // 64
++    return {
++        "q13": torch.empty((K // 8, 2 * N), dtype=torch.int32, device=device),
++        "f13": torch.empty((k13, n13, 128), dtype=torch.int32, device=device),
++        "g13": torch.empty((k13, n13, 128), dtype=torch.int32, device=device),
++        "q2": torch.empty((N // 8, K), dtype=torch.int32, device=device),
++        "f2": torch.empty((k2, n2, 128), dtype=torch.int32, device=device),
++        "g2": torch.empty((k2, n2, 128), dtype=torch.int32, device=device),
++    }
++
++
++def b12x_pack_slots_(w13, w2, s13, s2, K: int, N: int, scratch: Dict[str, torch.Tensor]) -> None:
++    """Pack one expert's raw fp4 weights and E8M0/K32 scales in place (b12x layout).
++
++    ``w13``/``w2``/``s13``/``s2`` are the flat uint8 views of one expert's four
++    slot regions, already holding the checkpoint bytes: w13 as ``[up; gate]``
++    (2N rows), w2 as ``[K, N/2]``, the scales as ``[rows, K/32]`` E8M0. The
++    weights are rotated, transposed and repacked through the preallocated
++    scratch, the scales through the vendored pack with reuse_input_storage=True.
++    Every mismatch raises: a half-packed slot must never be published.
++    """
++    repack_4bit, pack_scales = _b12x_pack_ops()
++    if w13.numel() != K * N or w2.numel() != K * N // 2:
++        raise RuntimeError(
++            f"A1_B12X: slot bytes {int(w13.numel())}/{int(w2.numel())} "
++            f"!= {K * N}/{K * N // 2}"
++        )
++    src13 = w13.view(torch.int32).view(2 * N, K // 8)
++    scratch["q13"][:, :N].copy_(src13[N:].T)
++    scratch["q13"][:, N:].copy_(src13[:N].T)
++    repack_4bit(
++        scratch["q13"],
++        size_k=K,
++        size_n=2 * N,
++        out=w13.view(torch.int32).view(K // 16, (2 * N) // 64, 128),
++        flat_scratch=scratch["f13"],
++        gather_scratch=scratch["g13"],
++    )
++    src2 = w2.view(torch.int32).view(K, N // 8)
++    scratch["q2"].copy_(src2.T)
++    repack_4bit(
++        scratch["q2"],
++        size_k=N,
++        size_n=K,
++        out=w2.view(torch.int32).view(N // 16, K // 64, 128),
++        flat_scratch=scratch["f2"],
++        gather_scratch=scratch["g2"],
++    )
++    packed13 = pack_scales(
++        s13.view(1, 2 * N, K // 32),
++        size_k=K,
++        size_n=2 * N,
++        row_rotation=N,
++        reuse_input_storage=True,
++    )
++    packed2 = pack_scales(
++        s2.view(1, K, N // 32),
++        size_k=N,
++        size_n=K,
++        reuse_input_storage=True,
++    )
++    if int(packed13.data_ptr()) != int(s13.data_ptr()):
++        raise RuntimeError("A1_B12X: w13 scale pack left the slot storage")
++    if int(packed2.data_ptr()) != int(s2.data_ptr()):
++        raise RuntimeError("A1_B12X: w2 scale pack left the slot storage")
+ 
+ 
+ def runtime() -> "A1Runtime":
+@@ -132,10 +231,12 @@
+     if n < CANARY:
+         raise RuntimeError(f"A1_EXEC: region of {n} bytes < canary {CANARY}")
+     return (0, min((n // 2) & ~63, n - CANARY), n - CANARY)
+-
+-
++# The ``b12x`` argument of copy_slot_ (a ``(K, N, scratch)`` triple) switches to the B12X slot-copy path: all four
++# regions are copied straight into the slot, the canary samples the *raw* bytes, and the slot is then packed into
++# the b12x w4a16 layout in place. The raw canary stays the operationally relevant check (a mis-staged or corrupt
++# copy); the packing itself is the same code the first load runs.
+ def copy_slot_(dsts, host: torch.Tensor, off: dict, perm: dict, land13: torch.Tensor, land2: torch.Tensor,
+-               canary: torch.Tensor) -> None:
++               canary: torch.Tensor, b12x=None) -> None:
+     """The copy of one staged expert into a slot (dsts = w13, w2, w13 scales, w2 scales as flat uint8 views), on
+     the current stream: weights direct, scales through the landing pads and the interleave permutation, then the
+     canary samples of all four destinations into ``canary`` (read back before the copy counts as done)."""
+@@ -144,6 +245,17 @@
+     o_w2, n_w2 = off["down_w"]
+     o_s13, n_s13 = off["up_s"][0], 2 * off["up_s"][1]
+     o_s2, n_s2 = off["down_s"]
++    if b12x is not None:
++        k, n, scratch = b12x
++        for dst, o, nb in ((w13, o_w13, n_w13), (w2, o_w2, n_w2), (s13, o_s13, n_s13), (s2, o_s2, n_s2)):
++            dst.copy_(host[o:o + nb], non_blocking=True)
++        kc = 0
++        for dst in (w13, w2, s13, s2):
++            for a in canary_offsets(dst.numel()):
++                canary[kc:kc + CANARY].copy_(dst[a:a + CANARY], non_blocking=True)
++                kc += CANARY
++        b12x_pack_slots_(w13, w2, s13, s2, k, n, scratch)
++        return
+     w13.copy_(host[o_w13:o_w13 + n_w13], non_blocking=True)
+     w2.copy_(host[o_w2:o_w2 + n_w2], non_blocking=True)
+     land13.copy_(host[o_s13:o_s13 + n_s13], non_blocking=True)
+@@ -165,6 +277,11 @@
+     o_s13, n_s13 = off["up_s"][0], 2 * off["up_s"][1]
+     o_s2, n_s2 = off["down_s"]
+     want = []
++    if perm_host is None:  # b12x: the canary samples the raw bytes, before the in-place pack
++        for o, n in ((o_w13, n_w13), (o_w2, n_w2), (o_s13, n_s13), (o_s2, n_s2)):
++            for a in canary_offsets(n):
++                want.append(host[o + a:o + a + CANARY])
++        return np.concatenate(want)
+     for o, n in ((o_w13, n_w13), (o_w2, n_w2)):
+         for a in canary_offsets(n):
+             want.append(host[o + a:o + a + CANARY])
+@@ -375,6 +492,11 @@
+         self.ckpt = CheckpointExperts(m0.kt_config.weight_path, self.N, self.K)
+         self.copy_stream = torch.cuda.Stream(device=t["dev"], priority=0)
+         self._make_perms()
++        # b12x packs weights and scales itself (b12x_pack_slots_), so there is no
++        # block_scale_interleave permutation to apply: no perm table, and the
++        # canary expectation reads the raw bytes.
++        if _B12X_ON:
++            self.perm, self.perm_host = {}, None
+         self._make_ring()
+         self._selftest()
+         for i in range(k.stagers):
+@@ -423,6 +545,9 @@
+                 "i": i,
+             })
+             self._free.put(i)
++        # b12x: one preallocated int32 scratch set for the swap pack, plus the
++        # landing pads stay unused (the b12x path copies straight into the slot).
++        self.b12x_pack = b12x_scratch(K, N, dev) if _B12X_ON else None
+ 
+     def _stage_host(self, e: dict, layer_idx: int, logical: int) -> None:
+         """Copy the six byte ranges of one expert out of the checkpoint into the staging entry (GIL released during
+@@ -453,7 +578,7 @@
+         with torch.cuda.stream(cs):
+             cs.wait_event(ev_read)
+             copy_slot_(self._dst(layer_idx, slot), e["host"], self.off, self.perm, e["land13"], e["land2"],
+-                       e["canary"])
++                       e["canary"], b12x=None if self.b12x_pack is None else (self.K, self.N, self.b12x_pack))
+             done = torch.cuda.Event()
+             done.record(cs)
+         return done
+@@ -475,7 +600,7 @@
+             # land into a scratch copy of the slot, never into the live slot
+             scratch = [torch.empty_like(x) for x in res]
+             with torch.cuda.stream(self.copy_stream):
+-                copy_slot_(scratch, e["host"], self.off, self.perm, e["land13"], e["land2"], e["canary"])
++                copy_slot_(scratch, e["host"], self.off, self.perm, e["land13"], e["land2"], e["canary"], b12x=None if self.b12x_pack is None else (self.K, self.N, self.b12x_pack))
+             self.copy_stream.synchronize()
+             if not self._canary_ok(e):
+                 bad.append(f"layer {li} slot {s}: canary of the self-test copy differs")
+diff -ruN a/python/sglang/srt/layers/moe/moe_runner/flashinfer_b12x_w4a16.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_b12x_w4a16.py
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_b12x_w4a16.py	1970-01-01 01:00:00.000000000 +0100
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_b12x_w4a16.py	2026-10-18 12:57:39.363512885 +0200
+@@ -0,0 +1,291 @@
++"""FlashInfer b12x w4a16 MoE fused func for the resident experts under A1.
++
++The A1 expert cache keeps the resident GPU experts' MXFP4
++weights and their E8M0/K32 scales in the *b12x packed* layout: the start set
++is packed in ``Mxfp4FlashinferCutlassMoEMethod.process_weights_after_loading``
++and every swap reproduces the same layout in ``a1_exec.copy_slot_``. The
++per-layer ``W4A16PackedWeights`` handed through the quant info therefore only
++*views* the resident slot tensors; nothing is repacked at run time.
++
++Correctness requirements:
++
++* a real int32 identity ``expert_map`` -- it is what switches
++  ``zero_fc2_output`` on, so the ``-1`` rows of CPU-bound experts cannot leak
++  their FC1 intermediates into the top-k sum (without it bs8/M8 is wrong), and
++* ``swiglu_limit`` forwarded explicitly -- ``B12xMoEWrapper``'s production
++  dispatch drops it on the way to the w4a16 kernel.
++
++This module is only imported when ``SGLANG_DS41_MU_A1_B12X_DECODE`` is on.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Optional
++
++import torch
++
++from sglang.srt.layers.moe.moe_runner.base import (
++    DispatchMoeRunnerCore,
++    MoeQuantInfo,
++    MoeRunnerConfig,
++    register_fused_func,
++)
++from sglang.srt.layers.moe.moe_runner.runner import register_moe_runner_core
++from sglang.srt.layers.moe.utils import MoeRunnerBackend
++
++if TYPE_CHECKING:
++    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
++
++logger = logging.getLogger(__name__)
++
++# Backend name of this runner. ``MoeRunnerBackend.FLASHINFER_B12X_W4A16`` holds
++# the same string; the enum member exists so ``register_fused_func`` accepts it.
++B12X_W4A16_BACKEND = MoeRunnerBackend.FLASHINFER_B12X_W4A16.value
++
++_identity_maps: dict[tuple[int, str], torch.Tensor] = {}
++
++
++def _identity_expert_map(num_experts: int, device: torch.device) -> torch.Tensor:
++    """The identity map that turns Zero-FC2 on (one tensor per count/device)."""
++    key = (int(num_experts), str(device))
++    m = _identity_maps.get(key)
++    if m is None:
++        m = torch.arange(int(num_experts), device=device, dtype=torch.int32)
++        _identity_maps[key] = m
++    return m
++
++
++def prewarm_identity_map(num_experts: int, device: torch.device) -> None:
++    """Build the identity expert map before the decode CUDA graphs are captured.
++
++    The first call allocates ``torch.arange``; doing that inside a capture would
++    grow the graph-private pool with a tensor nobody frees. The map never
++    changes, so the pre-capture hook builds it once per (count, device).
++    """
++    _identity_expert_map(num_experts, device)
++
++
++@dataclass
++class FlashInferB12xW4A16MoeQuantInfo(MoeQuantInfo):
++    """Payload for the b12x w4a16 fused MoE."""
++
++    # Views into the resident slot tensors, already in the b12x packed layout.
++    prepared: object  # W4A16PackedWeights
++    num_experts: int
++    top_k: int
++    hidden_size: int
++    intermediate_size: int
++    # Model SwiGLU clamp (DSv4: 10.0). Forwarded to the kernel on every call.
++    swiglu_limit: Optional[float] = None
++
++
++def w4a16_workspace(
++    *,
++    num_experts: int,
++    hidden_size: int,
++    intermediate_size: int,
++    top_k: int,
++    max_routed_rows: int,
++    device: torch.device,
++):
++    """The process-wide cached b12x w4a16 workspace of FlashInfer.
++
++    Allocated here (before the decode CUDA graphs are captured) and reused by
++    every call; FlashInfer grows it outside capture if a caller needs more.
++    """
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
++        _get_cached_workspace,
++    )
++
++    return _get_cached_workspace(
++        backend="w4a16",
++        state_E=int(num_experts),
++        weight_E=int(num_experts),
++        routed_rows=int(max_routed_rows),
++        k=int(hidden_size),
++        n=int(intermediate_size),
++        num_topk=int(top_k),
++        device=device,
++        quant_mode="w4a16",
++        activation="silu",
++    )
++
++
++def _run_b12x_w4a16(
++    quant_info: FlashInferB12xW4A16MoeQuantInfo,
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    output: torch.Tensor,
++) -> None:
++    """One b12x w4a16 MoE call over the resident slots. Fail-closed on mismatch."""
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
++        run_w4a16_moe,
++    )
++
++    prepared = quant_info.prepared
++    num_experts = int(quant_info.num_experts)
++    if int(getattr(prepared, "num_experts", -1)) != num_experts:
++        raise ValueError(
++            "B12X_W4A16: prepared.num_experts "
++            f"({getattr(prepared, 'num_experts', None)}) != num_experts "
++            f"({num_experts})"
++        )
++    if int(x.size(1)) != int(quant_info.hidden_size):
++        raise ValueError(
++            f"B12X_W4A16: x hidden {int(x.size(1))} != {quant_info.hidden_size}"
++        )
++    if int(topk_ids.size(1)) != int(quant_info.top_k):
++        raise ValueError(
++            f"B12X_W4A16: top_k {int(topk_ids.size(1))} != {quant_info.top_k}"
++        )
++    # A device->host sync (.item()) is forbidden while a CUDA graph is being
++    # captured, so the id range check runs outside capture only: the uncaptured
++    # warmup calls and an uncaptured validation probe drive it. During capture the ids come from
++    # A1 itself (slots or -1), and the shape/dtype checks above stay active.
++    if not torch.cuda.is_current_stream_capturing():
++        highest = int(topk_ids.max())
++        if highest >= num_experts and bool((topk_ids >= 0).any()):
++            raise ValueError(
++                f"B12X_W4A16: topk id {highest} >= num_experts {num_experts} "
++                "(ids must be slots or -1)"
++            )
++    if x.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
++        raise TypeError(
++            f"B12X_W4A16: bf16 in/out required, got x={x.dtype} out={output.dtype}"
++        )
++
++    ws = w4a16_workspace(
++        num_experts=num_experts,
++        hidden_size=int(quant_info.hidden_size),
++        intermediate_size=int(quant_info.intermediate_size),
++        top_k=int(quant_info.top_k),
++        max_routed_rows=int(x.size(0)) * int(quant_info.top_k),
++        device=x.device,
++    )
++    run_w4a16_moe(
++        x,
++        prepared,
++        topk_weights,
++        topk_ids,
++        activation="silu",
++        swiglu_limit=quant_info.swiglu_limit,
++        intermediate_cache13=ws.intermediate_cache13,
++        intermediate_cache2=ws.intermediate_cache2,
++        output=output,
++        fc1_c_tmp=ws.fc1_c_tmp,
++        fc2_c_tmp=ws.fc2_c_tmp,
++        packed_route_indices=ws.packed_route_indices,
++        block_expert_ids=ws.block_expert_ids,
++        packed_route_count=ws.packed_route_count,
++        expert_offsets=ws.expert_offsets,
++        expert_map=_identity_expert_map(num_experts, x.device),
++    )
++
++
++def b12x_w4a16_moe(
++    quant_info: FlashInferB12xW4A16MoeQuantInfo,
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++) -> torch.Tensor:
++    """Allocate (or take the provided) bf16 output and run one b12x w4a16 MoE call.
++
++    Mirrors the neighbouring fused funcs: the per-forward MoE output buffer the
++    forward scope offers is used when it fits, otherwise the buffer is allocated
++    under ``use_symmetric_memory`` when the run allocates symmetrically.
++    """
++    from sglang.srt.layers.dp_attention import is_allocation_symmetric
++    from sglang.srt.distributed import get_tp_group
++    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
++        use_symmetric_memory,
++    )
++    from sglang.srt.runtime_context import get_forward
++
++    num_tokens = int(x.shape[0])
++    hidden = int(quant_info.hidden_size)
++    if x.dtype != torch.bfloat16:
++        raise TypeError(f"B12X_W4A16: bf16 input required, got {x.dtype}")
++    provided = get_forward().moe_output_buffer
++    if (
++        provided is not None
++        and tuple(provided.shape) == (num_tokens, hidden)
++        and provided.dtype == torch.bfloat16
++        and provided.device == x.device
++    ):
++        output = provided
++    else:
++        with use_symmetric_memory(
++            get_tp_group(), disabled=not is_allocation_symmetric()
++        ):
++            output = torch.empty(
++                (num_tokens, hidden), dtype=torch.bfloat16, device=x.device
++            )
++    _run_b12x_w4a16(quant_info, x, topk_ids, topk_weights, output)
++    return output
++
++
++def _standard_topk(dispatch_output):
++    """topk_ids (int32) and topk_weights from a standard dispatch output."""
++    from sglang.srt.layers.moe.topk import TopKOutputChecker
++
++    topk_output = dispatch_output.topk_output
++    if TopKOutputChecker.format_is_bypassed(topk_output):
++        topk_output = topk_output.to_standard()
++    return topk_output.topk_ids.to(torch.int32), topk_output.topk_weights
++
++
++@register_fused_func("none", B12X_W4A16_BACKEND)
++def fused_experts_none_to_flashinfer_b12x_w4a16(
++    dispatch_output, quant_info: MoeQuantInfo, runner_config: MoeRunnerConfig
++):
++    """Run the resident experts on the SM120 b12x w4a16 kernel."""
++    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
++
++    if not isinstance(quant_info, FlashInferB12xW4A16MoeQuantInfo):
++        raise TypeError(
++            "flashinfer_b12x_w4a16 expects FlashInferB12xW4A16MoeQuantInfo, "
++            f"got {type(quant_info)}"
++        )
++    if runner_config.apply_router_weight_on_input:
++        raise ValueError(
++            "apply_router_weight_on_input is not supported for flashinfer_b12x_w4a16"
++        )
++
++    x = dispatch_output.hidden_states
++    topk_ids, topk_weights = _standard_topk(dispatch_output)
++    out = b12x_w4a16_moe(quant_info, x, topk_ids, topk_weights)
++    return StandardCombineInput(hidden_states=out)
++
++
++class B12xW4A16RunnerCore(DispatchMoeRunnerCore):
++    """Runner core of the b12x w4a16 backend.
++
++    The backend only runs the fused func; the core exists so ``MoeRunner``
++    resolves the backend name (the fused func alone is not enough, because the
++    built-in backend chain has no branch for a shipped-out-of-tree name).
++    """
++
++    @property
++    def runner_backend(self) -> MoeRunnerBackend:
++        return MoeRunnerBackend.FLASHINFER_B12X_W4A16
++
++    def run_from_dispatch(
++        self,
++        dispatch_output: "DispatchOutput",
++        quant_info: MoeQuantInfo,
++        runner_config: MoeRunnerConfig,
++        hooks=None,
++    ) -> "CombineInput":
++        return fused_experts_none_to_flashinfer_b12x_w4a16(
++            dispatch_output, quant_info, runner_config
++        )
++
++
++def _build_b12x_w4a16_runner_core(config: MoeRunnerConfig) -> B12xW4A16RunnerCore:
++    return B12xW4A16RunnerCore(config)
++
++
++register_moe_runner_core(B12X_W4A16_BACKEND, _build_b12x_w4a16_runner_core)
+diff -ruN a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+--- a/python/sglang/srt/layers/moe/utils.py	2026-09-10 08:27:42.000000000 +0200
++++ b/python/sglang/srt/layers/moe/utils.py	2026-10-18 12:57:39.381983132 +0200
+@@ -164,6 +164,8 @@
+ 
+     def is_aiter(self):
+         return self.value == MoeRunnerBackend.AITER.value
++    def is_flashinfer_b12x_w4a16(self):
++        return self.value == MoeRunnerBackend.FLASHINFER_B12X_W4A16.value
+ 
+ 
+ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
+@@ -185,6 +187,10 @@
+     AITER = "aiter"
+     HPC_OPS = "hpc_ops"
+     INTEL_XPU = "intel_xpu"
++    # b12x w4a16 MoE over the resident A1 slots on SM120 (moe_runner/
++    # flashinfer_b12x_w4a16.py); selected by Mxfp4FlashinferCutlassMoEMethod
++    # when SGLANG_DS41_MU_A1_B12X_DECODE is on.
++    FLASHINFER_B12X_W4A16 = "flashinfer_b12x_w4a16"
+ 
+ 
+ @dataclass(frozen=True)
+diff -ruN a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py	2026-10-18 11:53:23.497292933 +0200
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py	2026-10-18 12:57:39.421613452 +0200
+@@ -27,6 +27,88 @@
+ 
+ # MXFP4 group/block size (E8M0 scale per 32 fp4 weights).
+ _GROUP_SIZE = 32
++# SGLANG_DS41_MU_A1_B12X_DECODE=1 runs the GPU-resident experts (the A1 slots) on
++# the SM120 b12x w4a16 kernel (moe_runner/flashinfer_b12x_w4a16.py) instead of
++# the CUTLASS MXFP4 path. Default 0 keeps today's path byte for byte.
++# SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS defaults to 1: the KT streamed prefill
++# keeps calling cutlass_fused_moe directly. Setting it to 0 would need the
++# not-yet-built b12x stream path, so it fails closed instead of
++# silently changing the stream layout.
++B12X_DECODE_ON = os.environ.get("SGLANG_DS41_MU_A1_B12X_DECODE", "0") != "0"
++B12X_STREAM_CUTLASS_ON = (
++    os.environ.get("SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS", "1") != "0"
++)
++# Rows the b12x workspace is preallocated for, before the decode CUDA graphs
++# are captured. The b12x kernel runs the whole masked prefill chunk in one call
++# (it does not row-block), so the workspace has to cover chunked_prefill_size;
++# SGLANG_DS41_MU_A1_B12X_WORKSPACE_TOKENS (=0: unset) overrides it for a probe.
++B12X_WORKSPACE_TOKENS_ENV = "SGLANG_DS41_MU_A1_B12X_WORKSPACE_TOKENS"
++_B12X_WORKSPACE_TOKENS_DEFAULT = 16384
++
++
++def b12x_workspace_tokens() -> int:
++    """Tokens the b12x w4a16 workspace must cover (fail-soft, logged)."""
++    cap = int(os.environ.get(B12X_WORKSPACE_TOKENS_ENV, "0") or 0)
++    if cap > 0:
++        return cap
++    chunk = 0
++    try:
++        from sglang.srt.server_args import get_global_server_args
++
++        chunk = int(get_global_server_args().chunked_prefill_size or 0)
++    except Exception:
++        chunk = 0
++    return max(1, chunk or _B12X_WORKSPACE_TOKENS_DEFAULT)
++
++
++def _b12x_require_stream_cutlass() -> None:
++    """Fail closed: the b12x stream path does not exist yet."""
++    if not B12X_STREAM_CUTLASS_ON:
++        raise RuntimeError(
++            "SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS=0 was requested, but the KT "
++            "streamed prefill has no b12x path. Keep it "
++            "at 1 (stream stays on CUTLASS), or run without "
++            "SGLANG_DS41_MU_A1_B12X_DECODE."
++        )
++
++
++def _b12x_pack_into_slots(layer: Module) -> None:
++    """Pack one layer's resident slot tensors into the b12x layout, in place.
++
++    The resident weights and scales are rearranged *inside* the slot tensors
++    (``reuse_input_storage=True`` returns views) and the resulting
++    ``W4A16PackedWeights`` is kept on the layer, because ``a1_exec.copy_slot_``
++    reproduces exactly this layout on every swap. Nothing may pack here at run
++    time: FlashInfer caches the prepared weights by ``data_ptr``, and a second
++    pack would destroy the layout the cache still believes in.
++    """
++    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
++        prepare_w4a16_fp4_e8m0_k32_weights,
++    )
++
++    E = layer.w13_weight.shape[0]
++    device = layer.w13_weight.device
++    if not layer.w13_weight.is_contiguous() or not layer.w2_weight.is_contiguous():
++        raise ValueError("B12X_W4A16: resident weights must be contiguous.")
++    alpha = torch.ones(E, dtype=torch.float32, device=device)
++    prepared = prepare_w4a16_fp4_e8m0_k32_weights(
++        layer.w13_weight.data.view(torch.uint8),
++        layer.w13_weight_scale_inv.data.view(torch.uint8),
++        alpha,
++        layer.w2_weight.data.view(torch.uint8),
++        layer.w2_weight_scale_inv.data.view(torch.uint8),
++        alpha,
++        activation="silu",
++        params_dtype=torch.bfloat16,
++        w13_layout="w13",
++        reuse_input_storage=True,
++    )
++    if int(prepared.num_experts) != int(E):
++        raise ValueError(
++            f"B12X_W4A16: prepared {int(prepared.num_experts)} experts != slots {int(E)}"
++        )
++    layer._b12x_prepared = prepared
++    return prepared
+ 
+ 
+ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -48,6 +130,9 @@
+         self._swiglu_limit_tensor: torch.Tensor | None = None
+         self._use_swiglu_step = False
+         self._mxfp4_weight_global_scale_tensor: torch.Tensor | None = None
++        if B12X_DECODE_ON:
++            _b12x_require_stream_cutlass()
++        self._b12x_swiglu_limit: float | None = None
+ 
+     @property
+     def load_up_proj_weight_first(self) -> bool:
+@@ -125,6 +210,41 @@
+         import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+ 
+         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
++        # b12x w4a16: override with a second runner backend for the resident
++        # slots. The CUTLASS fused func above stays registered (the KT streamed
++        # prefill calls it directly), and the CUTLASS workspace is preallocated
++        # below either way. The b12x workspace is allocated here, before the
++        # decode CUDA graphs are captured.
++        if B12X_DECODE_ON:
++            _b12x_require_stream_cutlass()
++            self._b12x_swiglu_limit = (
++                float(clamp_limit) if clamp_limit is not None else None
++            )
++            from sglang.srt.layers.moe.moe_runner.flashinfer_b12x_w4a16 import (
++                B12X_W4A16_BACKEND,
++            )
++            from sglang.srt.layers.moe.moe_runner.flashinfer_b12x_w4a16 import (
++                w4a16_workspace as _b12x_workspace,
++            )
++
++            _b12x_workspace(
++                num_experts=E,
++                hidden_size=layer.w2_weight.shape[1],
++                intermediate_size=layer.w2_weight.shape[2] * 2,
++                top_k=int(layer.top_k),
++                max_routed_rows=b12x_workspace_tokens() * int(layer.top_k),
++                device=device,
++            )
++            # Same reason as the workspace above: the identity expert map is a
++            # device tensor, so it is built here and not inside a capture.
++            from sglang.srt.layers.moe.moe_runner.flashinfer_b12x_w4a16 import (
++                prewarm_identity_map as _b12x_prewarm_identity_map,
++            )
++
++            _b12x_prewarm_identity_map(num_experts=E, device=device)
++            self.runner = MoeRunner(
++                MoeRunnerBackend(B12X_W4A16_BACKEND), moe_runner_config
++            )
+ 
+         # Preallocate the process-wide CUTLASS workspace here, before the
+         # decode CUDA graphs are captured: FlashInfer otherwise allocates it
+@@ -182,7 +302,21 @@
+                 )
+         w13_scale_u8 = layer.w13_weight_scale_inv.data.view(torch.uint8)
+         w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8)
+-
++        # b12x w4a16 keeps the resident slots in its own packed layout. The
++        # packing happens here, deterministically at load -- not lazily in the
++        # first forward -- because FlashInfer caches the prepared weights by
++        # data_ptr and a second pack would destroy the layout the cache still
++        # believes in. The early return keeps the CUTLASS branch below
++        # byte-identical; b12x names its own backend.
++        if B12X_DECODE_ON:
++            if not self._use_mxfp8_act_scaling:
++                raise RuntimeError(
++                    "SGLANG_DS41_MU_A1_B12X_DECODE needs the SM120 MXFP4 expert path"
++                )
++            _b12x_require_stream_cutlass()
++            _b12x_pack_into_slots(layer)
++            layer._dsv4_mxfp4_backend = "flashinfer_b12x_w4a16"
++            return
+         if self._use_mxfp8_act_scaling:
+             from flashinfer import block_scale_interleave
+ 
+@@ -262,6 +396,26 @@
+         layer: Module,
+         dispatch_output: DispatchOutput,
+     ) -> CombineInput:
++        if B12X_DECODE_ON:
++            from sglang.srt.layers.moe.moe_runner.flashinfer_b12x_w4a16 import (
++                FlashInferB12xW4A16MoeQuantInfo,
++            )
++
++            prepared = getattr(layer, "_b12x_prepared", None)
++            if prepared is None:
++                raise RuntimeError(
++                    "B12X_W4A16: layer has no prepared b12x weights; "
++                    "process_weights_after_loading must run first."
++                )
++            quant_info = FlashInferB12xW4A16MoeQuantInfo(
++                prepared=prepared,
++                num_experts=int(layer.w13_weight.shape[0]),
++                top_k=int(layer.top_k),
++                hidden_size=int(layer.w2_weight.shape[1]),
++                intermediate_size=int(layer.w2_weight.shape[2]) * 2,
++                swiglu_limit=self._b12x_swiglu_limit,
++            )
++            return self.runner.run(dispatch_output, quant_info)
+         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+             FlashInferCutlassMxfp4MoeQuantInfo,
+         )

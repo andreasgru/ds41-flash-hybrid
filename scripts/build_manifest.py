@@ -46,7 +46,7 @@ def source_check(root):
     fp8=[p for p in files if p.startswith('config/fp8/')]
     adapter=[p for p in files if p.startswith('tools/engram-adapter/')]
     helpers={'scripts/endpoint.py','scripts/verify_model_shards.py','scripts/verify_runtime.py','scripts/supervisor.py','scripts/resolve_launcher.py','scripts/gpu_lock.py','scripts/standard-env.sh'}
-    if len(source)!=60 or len(fp8)!=7 or len(adapter)!=3 or 'config/expert-placement.json' not in files or not helpers <= set(files) or len(files)!=78:
+    if len(source)!=62 or len(fp8)!=7 or len(adapter)!=3 or 'config/expert-placement.json' not in files or not helpers <= set(files) or len(files)!=80:
         raise ValueError('SOURCE_PIN_COVERAGE_INVALID')
     actual_fp8={str(p.relative_to(root)) for p in (root/'config/fp8').glob('N=*.json')}
     if actual_fp8!=set(fp8):

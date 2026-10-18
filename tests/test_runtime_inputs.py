@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORACLE = ROOT / "tests" / "data" / "recorded-k22.json"
+ORACLE = ROOT / "tests" / "data" / "recorded-k22b.json"
 TEMP_PREFIX = "ds41-real-runtime-"
 PUBLIC_ENV_FILTER = re.compile(
     r"^(KT_|DSV41_|SGLANG_|CUDA_|FLASHINFER_|TORCH_|TORCHINDUCTOR_|TRITON_|"
@@ -313,7 +313,7 @@ class RealRuntimeInputTests(unittest.TestCase):
             and result.get("command") == expected_command
         )
 
-    def test_recorded_k22_environment_and_command_match(self):
+    def test_recorded_k22b_environment_and_command_match(self):
         result = self._print_command(self.install)
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(result.stdout)

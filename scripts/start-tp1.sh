@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Portable K22 entry. Origin: own implementation. Apache-2.0.
+# Portable K22b entry. Origin: own implementation. Apache-2.0.
 set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source "$script_dir/runtime-config.sh"

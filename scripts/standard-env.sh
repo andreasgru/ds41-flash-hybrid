@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# K22 configuration, with portable source/package paths.
+# K22b configuration, with portable source/package paths.
 # Origin: live standard environment, neutralized. License: Apache-2.0.
 ds41_standard_env() {
   export DS41_MODE=A DS41_FIPRE=FULL DS41_CB=1 DS41_FP8TREE=1 DS41_FP8=${DS41_FP8:-1}
@@ -29,7 +29,7 @@ ds41_standard_env() {
   export DS41_KT_EXPERT_SHM=0 KT_EXPERT_SHM=0 KT_GPU_STREAM_ZEROCOPY=0 A1_SOURCE=ckpt
   export SGLANG_DS41_MU_A1_CACHE=1 SGLANG_DS41_MU_A1_SWAP=1 SGLANG_DS41_MU_A1_BUDGET=2
   export SGLANG_DS41_MU_A1_STAT_S=1 SGLANG_DS41_MU_A1_RING=32 SGLANG_DS41_MU_A1_STAGER=1
-  # Historical K22 values: these two flags have no readers in the K22 tree.
-  # They do not enable GPU expert B12X decode; the dense MXFP8 flag above is active.
+  # K22b reads these flags: GPU-resident experts use B12X W4A16;
+  # streamed prefill remains on CUTLASS. Dense MXFP8 remains a separate path.
   export SGLANG_DS41_MU_A1_B12X_DECODE=1 SGLANG_DS41_MU_A1_B12X_STREAM_CUTLASS=1
 }

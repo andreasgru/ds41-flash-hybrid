@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.1.0-k22b — source reconstruction candidate
+
+Status: **K22b source reconstruction and 18 offline real-input tests passed**. Static interface and actual print-path workspace counterchecks passed.
+
+- Add the four-file SGLang overlay that activates GPU-resident expert B12X W4A16 decode; streamed prefill stays on CUTLASS and dense MXFP8 B12X remains active.
+- Preserve K22 native-module selection, placement, server arguments, memory limits and selected environment values. All 12 selected extension switches now have readers. Workspace allocation remains chunk-sized with an unset/zero override; nonzero overrides are rejected.
+- Reconstruct the seven-patch tree: 10,409 regular files, five symlink targets, four new overlay reversals, three originals matching K22, and the prior 56-file reversal. Three fail-closed controls passed. Runtime pins cover 62 sources and 80 files overall.
+- Retain the portable 93-entry plus port / 74-argument profile and explicit checkpoint marker. The K22b WSL run passed 18 tests against the seven-patch series and 80 pins; the earlier K22 pass remains separate. Static interface and actual print-path workspace counterchecks passed.
+- Record short-repeat quality/arithmetic results with the allowed arithmetic retry explicit, and distinguish longer aligned-stream plateau measurements from full-run or decode medians.
+- Preserve reference chronology: numerical reference v4 at standard switch, v5 later under the unchanged gate. Keep historical K22 limitations and all five red full-load gates.
+
+Native rebuilding, GPU inference, live service operation and full acceptance remain untested. A later B10 stage is separate and is not claimed by this tag.
+
+The K22b documentation also clarifies retrospectively that historical K22 measurement values come from internal run logs and their raw data are not published. The existing K22 commit and tag remain unchanged.
+
 ## v3.0.0-k22 — source reconstruction candidate
 
 Status: **source reconstruction and 18 offline real-input tests passed**. This entry describes the K22 source stage; it does not announce a validated native build or deployment.
@@ -14,7 +29,7 @@ Status: **source reconstruction and 18 offline real-input tests passed**. This e
 - Expose the additional checkpoint-source marker `A1_SOURCE=ckpt`; no exact historical environment-byte equivalence is claimed.
 - Separate historical K22 short-run measurements from the still-failed historical v2/r3 full-load gates. Native rebuild, deployment and new full acceptance remain untested.
 
-Later K22b and B10 stages are planned separately; no implementation or result for them is claimed by this tag.
+This historical K22 tag did not include the later K22b or B10 stages.
 
 ## v2.1.1 — 8 October 2026
 

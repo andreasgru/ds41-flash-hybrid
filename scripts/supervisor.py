@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Service ownership, memory limits and parser readiness for the K22 path.
+"""Service ownership, memory limits and parser readiness for the K22b path.
 
 Origin: own portable implementation of the live safety checks. Apache-2.0.
 """
